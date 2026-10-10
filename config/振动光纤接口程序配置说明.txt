@@ -1,0 +1,125 @@
+{
+  "boxid": "BOX_001", // 当前硬件盒子的ID
+  "alarm_send_delay_seconds": 9, // 【新功能】报警消息延迟发送秒数。延迟从收到MQ报警消息的时刻起算；0=立即发MQ；>0=按配置延迟推送告警消息（图片上传不受该延迟影响，收到告警即上传）
+  "jpg_quality": 30, // 【新功能】上传MinIO前JPEG图片压缩质量（0-100）。越大越清晰、图片体积越大；设为-1或缺失表示不压缩、按相机原始图片上传。通过调低该值可直接减小上传图片体积。
+  "vff_wait_timeout_seconds": 30, // 【新功能】等待上游vff振动定位图片的超时秒数；超时后放弃等待，继续处理该条报警（默认30秒）
+  "ptz_capture_wait_seconds": 10, // 【重要】云台相机通过 ONVIF PTZ 转到预置位后，等待多少秒"云台转到位、画面稳定"再抓图；默认10秒。定焦相机不调用预置位、直接抓图，不受该配置影响
+  "heartbeat": { // 心跳上报功能配置
+    "url": "http://172.16.61.59:9090/boxStatucService/boxStatus/add", // 接收心跳数据的HTTP接口地址
+    "interval_seconds": 30, // 周期性心跳的发送间隔（秒）
+    "status_timeout_seconds": 60 // 状态信息的超时阈值（秒）
+  },
+  "forward_unconfigured_alarms": false, // 是否转发未在`points`中配置点位的报警
+  "rabbitmq_in": { // 接收上游报警消息的RabbitMQ配置
+    "url": "amqp://admin:hhkj1234@172.16.61.130:5672/", // RabbitMQ的AMQP连接字符串
+    "exchange_in": "das.alarm", // 监听的交换机名称
+    "exchange_type": "fanout", // 交换机类型 (fanout, direct, topic)
+    "queue_name": "", // 绑定的队列名称（留空则创建临时队列）
+    "routing_key": "", // 路由键（fanout模式下忽略）
+    "durable": true // 是否持久化
+  },
+  "rabbitmq_status_in": { // 接收状态信息的RabbitMQ配置
+    "url": "amqp://admin:hhkj1234@172.16.61.130:5672/",
+    "exchange_in": "das.data",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_solar_in": { // 【新功能】接收太阳能电池电量信息的RabbitMQ配置
+    "url": "amqp://guest:guest@172.16.61.130:5672/",
+    "exchange_in": "das.solar",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_out": { // 发送处理结果到防洪的RabbitMQ配置
+    "url": "amqp://guest:guest@172.16.61.130:5672/",
+    "exchange_out": "das.processed",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true,
+    "forward_enabled": true // 【新功能】处理结果转发开关：true=发送MQ消息，false=不转发
+  },
+  "minio": { // MinIO对象存储的连接信息
+    "endpoint": "172.16.61.59:9000", // MinIO服务的地址和端口 (ip:port)
+    "access_key": "minioadmin", // 访问密钥
+    "secret_key": "minioadmin", // 私有密钥
+    "bucket_name": "hhkj", // 用于存储文件的存储桶名称
+    "path_prefix": "gxjc/test", // 上传到MinIO时的对象路径前缀
+    "secure": false // 是否使用HTTPS连接
+  },
+  "snapshots_dir": "/data/media/snapshots", // 本地临时存储抓拍图片的目录
+  "videos_dir": "/data/media/videos", // 本地临时存储下载视频的目录
+
+  // ============================================================
+  // 摄像机说明（重要变更）
+  // 1. 已彻底移除海康 / 大华 / 宇视厂商私有 SDK：
+  //    - 抓图、云台预置位控制统一使用 ONVIF 协议（onvif-zeep-async + httpx）；
+  //    - 录像下载统一使用各厂家私有 RTSP 回放协议（ffmpeg 拉流）。
+  // 2. 定焦相机不再有顶层 fixed_camera 配置，改为挂在每台云台相机的
+  //    cameras.<name>.fixed_camera 下，可单独启用/禁用（enabled）。
+  // ============================================================
+
+  "cameras": { // 云台相机设备定义字典（manufacturer 取值：hikvision / dahua / uniview）
+    "cam1": { // 摄像头的逻辑名称（自定义）
+      "ip":           "172.16.61.13", // 摄像头的IP地址
+      "username":     "admin", // 登录用户名（ONVIF 与 RTSP 共用）
+      "pwd":          "admin1234.", // 登录密码（ONVIF 与 RTSP 共用）
+      "manufacturer": "uniview", // 摄像头品牌，决定私有 RTSP 回放 URL 的拼接方式
+      "cameraid":     "1", // 摄像头的业务ID（用于上报）
+
+      "onvif_port":   80, // ONVIF 服务端口（抓图 / 云台预置位），默认 80
+      "onvif_profile": "", // 可选：指定 ONVIF 媒体 Profile（token 或 Name），留空则取第一个 Profile
+
+      "rtsp_port":    554, // 私有 RTSP 回放端口，默认 554
+      "channel":      1, // RTSP 回放通道号（大华/海康使用，从 1 开始；宇视忽略）
+      // 【重要】回放下载使用的码流编号：1=主码流，2=子码流，3=第三码流。
+      // 各厂家映射：宇视 record1/2/3、大华 subtype 0/1/2、海康 tracks 101/102/103。
+      // 注意：摄像机可以只对某一路码流开启录像。若日志出现
+      //   "ffmpeg 拉取 RTSP 回放流失败 ... Output file does not contain any stream"
+      // 说明该码流在请求时间段内没有录像数据，此时需要
+      //   ① 在摄像机侧开启该码流的录像；或
+      //   ② 把本项改成实际有录像的那一路码流（例如实测 172.16.61.13 的主码流
+      //      record1 无录像、子码流 record2 有录像，故此处配置为 2）。
+      "stream_type":  2,
+      "tracks_id":    null, // 可选：海康 tracksID 覆盖值（现场 NVR/DVR 特殊编号时使用），默认 通道号*100+码流号
+
+      "download_delay_seconds": 20, // 【新功能】收到MQ报警消息后延迟多少秒再开始下载录像（逐相机生效，缺失或为0表示收到消息后立即下载）
+      "video_download_before_seconds": 10, // 【新功能】报警时刻前截取视频的长度（秒），默认15
+      "video_download_after_seconds": 10, // 【新功能】报警时刻后截取视频的长度（秒），默认15
+      "video_download_timeout": 0, // 【新功能】单次 ffmpeg 拉流超时（秒）；<=0 或缺失时按 拉流时长*4、下限60秒计算
+
+      "fixed_camera": { // 【新功能】本云台相机配套的定焦相机（可禁用：enabled=false；缺失或为 null 表示不使用定焦抓图）
+        "enabled":      true, // 是否启用该定焦相机（false=跳过定焦抓图与左右拼接）
+        "ip":           "172.16.61.109", // 定焦相机IP
+        "username":     "admin", // 登录用户名
+        "pwd":          "HHkj1994", // 登录密码
+        "manufacturer": "dahua", // 定焦相机品牌（仅用于录像回放 URL，定焦相机不下载录像）
+        "onvif_port":   80, // ONVIF 服务端口，默认 80
+        "channel":      1, // RTSP 回放通道号（定焦相机不下载录像，通常无需修改）
+        "stream_type":  1 // 码流编号：1=主码流，2=子码流，3=第三码流
+      }
+    }
+  },
+
+  // 私有 RTSP 回放协议时间语义速查（详见项目根目录《私有RTSP回放协议说明.md》）
+  //   宇视：参数为 UTC —— 本地时间 - 8 小时
+  //   海康：参数为 UTC —— 本地时间 - 8 小时
+  //   大华：参数为本地时间 —— 原样填写，不减 8 小时
+  // 以上换算由程序自动完成，无需在配置中处理。
+
+  "points": { // 点位与摄像头的联动规则映射
+    "1-1": { // 点位范围 (格式 "min-max")
+      "camera": "cam1", // 联动的摄像头逻辑名称 (必须在cameras中已定义)
+      "preset": 2 // 移动到的预置点编号 (-1表示不移动)
+    },
+    "2-2": { "camera": "cam1", "preset": 3 },
+    "3-3": { "camera": "cam1", "preset": 4 },
+    "4-4": { "camera": "cam1", "preset": 5 },
+    "5-5": { "camera": "cam1", "preset": 6 },
+    "6-50": { "camera": "cam1", "preset": 3 }
+  }
+}

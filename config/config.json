@@ -1,0 +1,114 @@
+{
+  "boxid": "BOX_001",
+  "alarm_send_delay_seconds": 9,
+  "jpg_quality": 30,
+  "vff_wait_timeout_seconds": 30,
+  "ptz_capture_wait_seconds": 10,
+  "heartbeat": {
+    "url": "http://172.16.61.59:9090/boxStatucService/boxStatus/add",
+    "interval_seconds": 30,
+    "status_timeout_seconds": 60
+  },
+  "forward_unconfigured_alarms": false,
+  "rabbitmq_in": {
+    "url": "amqp://admin:hhkj1234@172.16.61.130:5672/",
+    "exchange_in": "das.alarm",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_status_in": {
+    "url": "amqp://admin:hhkj1234@172.16.61.130:5672/",
+    "exchange_in": "das.data",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_solar_in": {
+    "url": "amqp://guest:guest@172.16.61.130:5672/",
+    "exchange_in": "das.solar",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_out": {
+    "url": "amqp://guest:guest@172.16.61.130:5672/",
+    "exchange_out": "das.processed",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true,
+    "forward_enabled": true
+  },
+  "minio": {
+    "endpoint": "172.16.61.59:9000",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "bucket_name": "hhkj",
+    "path_prefix": "gxjc/test",
+    "secure": false
+  },
+  "snapshots_dir": "/data/media/snapshots",
+  "videos_dir": "/data/media/videos",
+  "cameras": {
+    "cam1": {
+      "ip": "172.16.61.13",
+      "username": "admin",
+      "pwd": "admin1234.",
+      "manufacturer": "uniview",
+      "cameraid": "1",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 2,
+      "rtsp_port": 554,
+      "download_delay_seconds": 20,
+      "video_download_before_seconds": 10,
+      "video_download_after_seconds": 10,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "172.16.61.109",
+        "username": "admin",
+        "pwd": "HHkj1994",
+        "manufacturer": "dahua",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    },
+    "cam2": {
+      "ip": "172.16.61.109",
+      "username": "admin",
+      "pwd": "HHkj1994",
+      "manufacturer": "dahua",
+      "cameraid": "2",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 1,
+      "rtsp_port": 554,
+      "download_delay_seconds": 20,
+      "video_download_before_seconds": 15,
+      "video_download_after_seconds": 15,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "172.16.61.109",
+        "username": "admin",
+        "pwd": "HHkj1994",
+        "manufacturer": "dahua",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    }
+  },
+  "points": {
+    "1-1": { "camera": "cam1", "preset": 2 },
+    "2-2": { "camera": "cam2", "preset": 3 },
+    "3-3": { "camera": "cam3", "preset": 4 },
+    "4-4": { "camera": "cam1", "preset": 5 },
+    "5-5": { "camera": "cam3", "preset": 2 },
+    "6-10": { "camera": "cam2", "preset": 3 }
+  }
+}

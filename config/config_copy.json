@@ -1,0 +1,88 @@
+{
+  "boxid": "200",
+  "alarm_send_delay_seconds": 10,
+  "jpg_quality": 30,
+  "vff_wait_timeout_seconds": 30,
+  "ptz_capture_wait_seconds": 10,
+  "heartbeat": {
+    "url": "http://172.16.211.200:8000/boxStatucService/boxStatus/add",
+    "interval_seconds": 30,
+    "status_timeout_seconds": 60
+  },
+  "forward_unconfigured_alarms": false,
+  "rabbitmq_in": {
+    "url": "amqp://admin:hhkj1234@localhost:5672/",
+    "exchange_in": "das.alarm",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_status_in": {
+    "url": "amqp://admin:hhkj1234@localhost:5672/",
+    "exchange_in": "das.data",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_solar_in": {
+    "url": "amqp://guest:guest@localhost:5672/",
+    "exchange_in": "das.solar",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_out": {
+    "url": "amqp://hhkj:hhkj@172.16.211.200:5672/",
+    "exchange_out": "hhfh",
+    "exchange_type": "direct",
+    "queue_name": "fh_alarm",
+    "routing_key": "hhfh",
+    "durable": true,
+    "forward_enabled": true
+  },
+  "minio": {
+    "endpoint": "172.16.211.200:9000",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "bucket_name": "hhkj",
+    "path_prefix": "gxjc/K3+3",
+    "secure": false
+  },
+  "snapshots_dir": "snapshots",
+  "videos_dir": "videos",
+  "cameras": {
+    "cam1": {
+      "ip": "172.16.211.237",
+      "username": "admin",
+      "pwd": "admin1234.",
+      "manufacturer": "uniview",
+      "cameraid": "C0200",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 1,
+      "rtsp_port": 554,
+      "download_delay_seconds": 40,
+      "video_download_before_seconds": 20,
+      "video_download_after_seconds": 10,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "172.16.211.237",
+        "username": "admin",
+        "pwd": "admin1234.",
+        "manufacturer": "uniview",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    }
+  },
+  "points": {
+    "1-6": { "camera": "cam1", "preset": 2 },
+    "7-7": { "camera": "cam1", "preset": 2 },
+    "8-8": { "camera": "cam1", "preset": 3 },
+    "9-9": { "camera": "cam1", "preset": 4 }
+  }
+}
