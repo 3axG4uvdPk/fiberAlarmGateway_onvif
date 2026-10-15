@@ -16,3 +16,8 @@ logs/
 .idea/
 .vscode/
 *.swp
+
+# Windows 版随项目分发的 ffmpeg 免安装包（含 >100MB 的 DLL，不入库；
+# 本地打包/运行时放一份在项目根目录下的 ffmpeg-win64/ 即可，
+# 程序会自动从该目录或系统 PATH / 环境变量 ALARM_FFMPEG_PATH 定位）。
+ffmpeg-win64/

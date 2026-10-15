@@ -21,6 +21,12 @@ from datetime import datetime
 logger = logging.getLogger("alarm_app.processing")
 
 from core.config import resolve_runtime_path
+from core.ffmpeg_utils import (
+    resolve_ffmpeg_path,
+    resolve_ffprobe_path,
+    no_window_kwargs,
+    ffmpeg_missing_hint,
+)
 
 
 def ensure_dir(path):
@@ -64,8 +70,14 @@ class ProcessingWorker(threading.Thread):
             self.config.get('videos_dir', 'videos')
         )
         self.boxid = self.config.get('boxid', 'UNKNOWN_BOX')
-        self.ffmpeg_path = shutil.which('ffmpeg')
-        self.ffprobe_path = shutil.which('ffprobe')
+        # ffmpeg/ffprobe 优先使用随项目分发的免安装包（ffmpeg-win64/bin），
+        # 不再依赖系统 PATH；缺失时图片拼接与尺寸探测不可用（仅记录告警）。
+        self.ffmpeg_path = resolve_ffmpeg_path()
+        self.ffprobe_path = resolve_ffprobe_path()
+        if not self.ffmpeg_path:
+            logger.warning(ffmpeg_missing_hint('ffmpeg'))
+        if not self.ffprobe_path:
+            logger.warning(ffmpeg_missing_hint('ffprobe'))
         self.vff_wait_timeout_seconds = self._parse_vff_wait_timeout(
             self.config.get('vff_wait_timeout_seconds', self.VFF_WAIT_TIMEOUT_SECONDS)
         )
@@ -973,7 +985,7 @@ class ProcessingWorker(threading.Thread):
     def _merge_snapshots(self, primary_path, fixed_path, output_path):
         """将定焦图放左侧、云台主抓图放右侧，左右拼接成一张图。"""
         if not self.ffmpeg_path:
-            raise RuntimeError('未找到 ffmpeg，无法执行定焦图片拼接。')
+            raise RuntimeError(ffmpeg_missing_hint('ffmpeg'))
         command = [
             self.ffmpeg_path,
             '-y',
@@ -990,8 +1002,11 @@ class ProcessingWorker(threading.Thread):
             command,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=30,
             check=False,
+            **no_window_kwargs(),
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or 'ffmpeg 拼接失败')
@@ -1013,8 +1028,11 @@ class ProcessingWorker(threading.Thread):
              '-show_entries', 'stream=width', '-of', 'default=noprint_wrappers=1:nokey=1', image_path],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=10,
             check=False,
+            **no_window_kwargs(),
         )
         try:
             return int(result.stdout.strip())
@@ -1030,8 +1048,11 @@ class ProcessingWorker(threading.Thread):
              '-show_entries', 'stream=height', '-of', 'default=noprint_wrappers=1:nokey=1', image_path],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=10,
             check=False,
+            **no_window_kwargs(),
         )
         try:
             return int(result.stdout.strip())
@@ -1048,8 +1069,11 @@ class ProcessingWorker(threading.Thread):
              '-of', 'csv=p=0', image_path],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=10,
             check=False,
+            **no_window_kwargs(),
         )
         try:
             w, h = [p for p in result.stdout.strip().split(',')][:2]
@@ -1060,7 +1084,7 @@ class ProcessingWorker(threading.Thread):
     def _append_vff_below(self, base_path, vff_path, output_path):
         """将 vff 图缩放到与开始图片相同宽度后拼接到下方（base_path 在上、vff 在下）。"""
         if not self.ffmpeg_path:
-            raise RuntimeError('未找到 ffmpeg，无法执行 vff 图片拼接。')
+            raise RuntimeError(ffmpeg_missing_hint('ffmpeg'))
         if not os.path.exists(vff_path):
             raise RuntimeError(f'vff 图片不存在: {vff_path}')
 
@@ -1086,8 +1110,11 @@ class ProcessingWorker(threading.Thread):
             command,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=30,
             check=False,
+            **no_window_kwargs(),
         )
         try:
             if result.returncode != 0:

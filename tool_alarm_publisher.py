@@ -11,8 +11,8 @@ import pika
 # --- 配置区 ---
 # RabbitMQ 连接信息
 #盒子
-# RABBIT_URL = "amqp://admin:hhkj1234@192.168.1.10:5672/"
-RABBIT_URL = "amqp://guest:guest@localhost:5672/"
+RABBIT_URL = "amqp://admin:hhkj1234@172.16.61.130:5672/"
+# RABBIT_URL = "amqp://guest:guest@localhost:5672/"
 EXCHANGE = "das.alarm"
 EXCHANGE_TYPE = "fanout"
 ROUTING_KEY = ""
@@ -30,8 +30,8 @@ ALARM_DURATION_SECONDS = 20  # 2. 告警持续 n 秒
 UPDATE_INTERVAL_SECONDS = 1  # 3. 在持续期间，每隔多少秒发送一次更新（设为1即每秒一次）
 POINT_RANGE_START = 1  # 4. 点位范围开始
 POINT_RANGE_END = 10  # 5. 点位范围结束
-VFF_IMAGE_PATH = "/data/likai/fiberAlarm/fiberAlarmGateway/vff图2.png"  # 6. vff 图片固定路径，非空时结束告警会携带 vff_path 字段（例如 "/home/gxjc/fbg/vff/test.png"）
-
+# VFF_IMAGE_PATH = "/data/likai/fiberAlarm/fiberAlarmGateway/vff图2.png"  # 6. vff 图片固定路径，非空时结束告警会携带 vff_path 字段（例如 "/home/gxjc/fbg/vff/test.png"）
+VFF_IMAGE_PATH = "D:/project/vff图2.png"
 # --- VFF 图片发送时机配置 ---
 # 可选值:
 #   "before_end": 在结束告警之前发送（在告警持续期间发送，携带 vff_path 字段）

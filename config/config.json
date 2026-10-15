@@ -51,33 +51,9 @@
     "path_prefix": "gxjc/test",
     "secure": false
   },
-  "snapshots_dir": "/data/media/snapshots",
-  "videos_dir": "/data/media/videos",
+  "snapshots_dir": "D:/data/media/snapshots",
+  "videos_dir": "D:/data/media/videos",
   "cameras": {
-    "cam1": {
-      "ip": "172.16.61.13",
-      "username": "admin",
-      "pwd": "admin1234.",
-      "manufacturer": "uniview",
-      "cameraid": "1",
-      "onvif_port": 80,
-      "channel": 1,
-      "stream_type": 2,
-      "rtsp_port": 554,
-      "download_delay_seconds": 20,
-      "video_download_before_seconds": 10,
-      "video_download_after_seconds": 10,
-      "fixed_camera": {
-        "enabled": true,
-        "ip": "172.16.61.109",
-        "username": "admin",
-        "pwd": "HHkj1994",
-        "manufacturer": "dahua",
-        "onvif_port": 80,
-        "channel": 1,
-        "stream_type": 1
-      }
-    },
     "cam2": {
       "ip": "172.16.61.109",
       "username": "admin",
@@ -92,11 +68,11 @@
       "video_download_before_seconds": 15,
       "video_download_after_seconds": 15,
       "fixed_camera": {
-        "enabled": true,
-        "ip": "172.16.61.109",
+        "enabled": false,
+        "ip": "172.16.61.64",
         "username": "admin",
-        "pwd": "HHkj1994",
-        "manufacturer": "dahua",
+        "pwd": "Hhkj1994",
+        "manufacturer": "hikvision",
         "onvif_port": 80,
         "channel": 1,
         "stream_type": 1
@@ -104,11 +80,11 @@
     }
   },
   "points": {
-    "1-1": { "camera": "cam1", "preset": 2 },
+    "1-1": { "camera": "cam2", "preset": 2 },
     "2-2": { "camera": "cam2", "preset": 3 },
-    "3-3": { "camera": "cam3", "preset": 4 },
-    "4-4": { "camera": "cam1", "preset": 5 },
-    "5-5": { "camera": "cam3", "preset": 2 },
+    "3-3": { "camera": "cam2", "preset": 4 },
+    "4-4": { "camera": "cam2", "preset": 5 },
+    "5-5": { "camera": "cam2", "preset": 2 },
     "6-10": { "camera": "cam2", "preset": 3 }
   }
 }

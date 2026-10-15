@@ -105,43 +105,43 @@ def main():
 
     logger.info("应用程序作为后台服务启动...")
 
-    # ========== 看门狗环境检测 ==========
-    watchdog_process = None
-    HEARTBEAT_FILE = f"/tmp/alarm_gateway_heartbeat_{os.getpid()}.tmp"
-    PARENT_HEARTBEAT_TIMEOUT = 5
-    IS_UNDER_SYSTEMD_WATCHDOG = 'WATCHDOG_USEC' in os.environ
+    # ========== 看门狗环境检测（已临时注释）==========
+    # watchdog_process = None
+    # HEARTBEAT_FILE = f"/tmp/alarm_gateway_heartbeat_{os.getpid()}.tmp"
+    # PARENT_HEARTBEAT_TIMEOUT = 5
+    # IS_UNDER_SYSTEMD_WATCHDOG = 'WATCHDOG_USEC' in os.environ
+    #
+    # if IS_UNDER_SYSTEMD_WATCHDOG:
+    #     logger.info("检测到 systemd 看门狗环境，将启动看门狗子进程。")
+    #     try:
+    #         with open(HEARTBEAT_FILE, 'w') as f:
+    #             pass
+    #         logger.info(f"已成功创建初始心跳文件: {HEARTBEAT_FILE}")
+    #     except Exception as e:
+    #         logger.error(f"创建初始心跳文件失败: {e}", exc_info=True)
+    #
+    #     if sys.platform == "linux":
+    #         try:
+    #             watchdog_script_path = os.path.join(PROJECT_ROOT, "watchdog_process.py")
+    #             command = [
+    #                 sys.executable,
+    #                 watchdog_script_path,
+    #                 "--heartbeat-file", HEARTBEAT_FILE,
+    #                 "--pid", str(os.getpid()),
+    #                 "--timeout", str(PARENT_HEARTBEAT_TIMEOUT)
+    #             ]
+    #             logger.info(f"正在启动看门狗子进程: {' '.join(command)}")
+    #             watchdog_process = subprocess.Popen(command)
+    #         except Exception as e:
+    #             logger.error(f"启动看门狗子进程失败: {e}", exc_info=True)
+    #     else:
+    #         logger.warning("Systemd 看门狗环境仅在 Linux 上受支持。")
+    # else:
+    #     logger.info("未检测到 systemd 看门狗环境，以独立模式运行（无看门狗）。")
 
-    if IS_UNDER_SYSTEMD_WATCHDOG:
-        logger.info("检测到 systemd 看门狗环境，将启动看门狗子进程。")
-        try:
-            with open(HEARTBEAT_FILE, 'w') as f:
-                pass
-            logger.info(f"已成功创建初始心跳文件: {HEARTBEAT_FILE}")
-        except Exception as e:
-            logger.error(f"创建初始心跳文件失败: {e}", exc_info=True)
-
-        if sys.platform == "linux":
-            try:
-                watchdog_script_path = os.path.join(PROJECT_ROOT, "watchdog_process.py")
-                command = [
-                    sys.executable,
-                    watchdog_script_path,
-                    "--heartbeat-file", HEARTBEAT_FILE,
-                    "--pid", str(os.getpid()),
-                    "--timeout", str(PARENT_HEARTBEAT_TIMEOUT)
-                ]
-                logger.info(f"正在启动看门狗子进程: {' '.join(command)}")
-                watchdog_process = subprocess.Popen(command)
-            except Exception as e:
-                logger.error(f"启动看门狗子进程失败: {e}", exc_info=True)
-        else:
-            logger.warning("Systemd 看门狗环境仅在 Linux 上受支持。")
-    else:
-        logger.info("未检测到 systemd 看门狗环境，以独立模式运行（无看门狗）。")
-
-    # ========== 启动内部心跳线程 ==========
-    parent_heartbeat = ParentHeartbeatThread(HEARTBEAT_FILE)
-    parent_heartbeat.start()
+    # ========== 启动内部心跳线程（已临时注释）==========
+    # parent_heartbeat = ParentHeartbeatThread(HEARTBEAT_FILE)
+    # parent_heartbeat.start()
 
     # ========== 初始化核心组件 ==========
     processing_queue = queue.Queue()
@@ -214,9 +214,9 @@ def main():
             if not processing_worker.is_alive():
                 logger.critical("核心处理线程已停止！正在关闭应用...")
                 break
-            if watchdog_process and watchdog_process.poll() is not None:
-                logger.critical("看门狗子进程意外退出！请检查日志。")
-                break
+            # if watchdog_process and watchdog_process.poll() is not None:
+            #     logger.critical("看门狗子进程意外退出！请检查日志。")
+            #     break
     except KeyboardInterrupt:
         # 兜底：极端情况下信号处理器未生效时仍能走优雅关闭
         logger.info("收到关闭信号 (Ctrl+C)，开始关闭程序...")
@@ -235,26 +235,26 @@ def main():
             if t.is_alive():
                 t.join(timeout=5)
 
-        if parent_heartbeat.is_alive():
-            parent_heartbeat.stop()
+        # if parent_heartbeat.is_alive():
+        #     parent_heartbeat.stop()
 
-        # 终止看门狗子进程
-        if watchdog_process and watchdog_process.poll() is None:
-            logger.info("正在终止看门狗子进程...")
-            watchdog_process.terminate()
-            try:
-                watchdog_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                logger.warning("看门狗子进程在2秒内未终止，将强制杀死。")
-                watchdog_process.kill()
+        # 终止看门狗子进程（已临时注释）
+        # if watchdog_process and watchdog_process.poll() is None:
+        #     logger.info("正在终止看门狗子进程...")
+        #     watchdog_process.terminate()
+        #     try:
+        #         watchdog_process.wait(timeout=2)
+        #     except subprocess.TimeoutExpired:
+        #         logger.warning("看门狗子进程在2秒内未终止，将强制杀死。")
+        #         watchdog_process.kill()
 
-        # 清理心跳文件
-        try:
-            if os.path.exists(HEARTBEAT_FILE):
-                os.remove(HEARTBEAT_FILE)
-                logger.info("已清理心跳文件。")
-        except Exception as e:
-            logger.error(f"清理心跳文件时出错: {e}")
+        # 清理心跳文件（已临时注释）
+        # try:
+        #     if os.path.exists(HEARTBEAT_FILE):
+        #         os.remove(HEARTBEAT_FILE)
+        #         logger.info("已清理心跳文件。")
+        # except Exception as e:
+        #     logger.error(f"清理心跳文件时出错: {e}")
 
         # 清理相机与 SDK 资源（被信号打断时也不会以半清理状态退出）
         cam_mgr.cleanup()

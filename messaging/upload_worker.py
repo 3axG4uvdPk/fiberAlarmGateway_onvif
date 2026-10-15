@@ -7,7 +7,6 @@ MinIO 不可用时自动暂存失败任务，待连接恢复后自动重试。
 """
 import os
 import json
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -19,6 +18,8 @@ import pika
 from datetime import datetime
 
 logger = logging.getLogger("alarm_app.upload")
+
+from core.ffmpeg_utils import resolve_ffmpeg_path, no_window_kwargs
 
 class UploadWorker(threading.Thread):
     """异步上传线程：将 MQ 转发和 MinIO 上传解耦。"""
@@ -53,7 +54,12 @@ class UploadWorker(threading.Thread):
         )
         # JPEG 压缩质量（1-100，越大越清晰体积越大；<=0 或缺失表示不压缩上传原图）
         self.jpg_quality = self._parse_jpg_quality(config.get('jpg_quality', -1))
-        self.ffmpeg_path = shutil.which('ffmpeg')
+        # 图片重压缩所用 ffmpeg：优先使用随项目分发的免安装包（ffmpeg-win64/bin）
+        self.ffmpeg_path = resolve_ffmpeg_path()
+        if self.jpg_quality > 0 and not self.ffmpeg_path:
+            logger.warning(
+                "未找到 ffmpeg，jpg_quality 图片压缩功能不可用，将按原图上传。"
+            )
         self._is_running = True
         self._upload_thread = threading.Thread(
             target=self._upload_loop,
@@ -490,8 +496,11 @@ class UploadWorker(threading.Thread):
                  '-update', '1', tmp_out],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=30,
                 check=False,
+                **no_window_kwargs(),
             )
             if result.returncode != 0 or not os.path.exists(tmp_out) or os.path.getsize(tmp_out) == 0:
                 raise RuntimeError(result.stderr.strip() or 'JPEG 重压缩失败')

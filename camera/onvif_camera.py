@@ -21,6 +21,7 @@ import concurrent.futures
 import logging
 import re
 import threading
+from typing import Any
 
 logger = logging.getLogger("alarm_app.camera.onvif")
 
@@ -344,7 +345,7 @@ def probe(cam_cfg, timeout=DEFAULT_ONVIF_OPERATION_TIMEOUT_SECONDS):
     """探测设备 ONVIF 能力，返回 Profile 与 PTZ 支持情况。"""
     tag = _device_tag(cam_cfg)
     try:
-        result = _submit(_probe(cam_cfg), timeout, f"{tag} ONVIF 连接探测")
+        result: dict[str, Any | str | list[dict[str, str]] | bool] = _submit(_probe(cam_cfg), timeout, f"{tag} ONVIF 连接探测")
     except OnvifError:
         # 探测失败时丢弃可能已损坏的会话，避免污染后续操作
         forget_device(cam_cfg)
