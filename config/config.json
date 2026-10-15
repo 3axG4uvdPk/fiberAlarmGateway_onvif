@@ -51,8 +51,8 @@
     "path_prefix": "gxjc/test",
     "secure": false
   },
-  "snapshots_dir": "D:/data/media/snapshots",
-  "videos_dir": "D:/data/media/videos",
+  "snapshots_dir": "/data/media/snapshots",
+  "videos_dir": "/data/media/videos",
   "cameras": {
     "cam2": {
       "ip": "172.16.61.109",

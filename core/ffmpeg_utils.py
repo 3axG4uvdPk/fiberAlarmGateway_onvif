@@ -21,10 +21,15 @@ from core.config import get_runtime_base_dir, resolve_runtime_path
 logger = logging.getLogger("alarm_app.ffmpeg")
 
 # 随项目分发的 ffmpeg 免安装包目录（相对运行根目录），按优先级排列
+# - Windows：ffmpeg-win64/bin（含 ffmpeg.exe / ffprobe.exe 及 DLL）
+# - Linux  ：ffmpeg-linux64/bin（含 ffmpeg / ffprobe 及 .so）
+# 二者均放在项目根目录下，由对应平台的构建脚本随包分发。
 BUNDLED_FFMPEG_DIRS = (
     os.path.join('ffmpeg-win64', 'bin'),
+    os.path.join('ffmpeg-linux64', 'bin'),
     os.path.join('ffmpeg', 'bin'),
     'ffmpeg-win64',
+    'ffmpeg-linux64',
     'ffmpeg',
     'bin',
 )
@@ -138,7 +143,10 @@ def resolve_ffprobe_path():
 
 def ffmpeg_missing_hint(binary_name='ffmpeg'):
     """返回「未找到 ffmpeg/ffprobe」时便于现场排查的提示文本。"""
-    expected = os.path.join('ffmpeg-win64', 'bin', _exe_name(binary_name))
+    expected = os.path.join(
+        'ffmpeg-win64' if os.name == 'nt' else 'ffmpeg-linux64',
+        'bin', _exe_name(binary_name)
+    )
     try:
         expected_path = os.path.join(get_runtime_base_dir(), expected)
     except Exception:
