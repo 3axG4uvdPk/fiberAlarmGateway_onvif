@@ -16,11 +16,10 @@
 """
 import os
 import re
-import sys
 import time
 import queue
+import shlex
 import shutil
-import signal
 import threading
 import collections
 import concurrent.futures
@@ -33,6 +32,12 @@ from urllib.parse import quote
 logger = logging.getLogger("alarm_app.video")
 
 from core.config import resolve_runtime_path
+from core.ffmpeg_utils import (
+    resolve_ffmpeg_path,
+    run_command,
+    no_window_kwargs,
+    ffmpeg_missing_hint,
+)
 
 # 关闭信号事件：主程序停止时置位，正在执行的重试任务会尽快退出，
 # 避免 thread_pool.shutdown(wait=True) 被无限重试的任务阻塞导致关闭卡死。
@@ -182,28 +187,18 @@ def build_playback_rtsp_url(cam_cfg, start_dt, end_dt):
     raise ValueError(f"不支持的相机厂家，无法拼接 RTSP 回放 URL: {cam_cfg.get('manufacturer')!r}")
 
 
-def quote_for_shell(value):
-    """把参数包装成「整体带引号」的 shell 字符串。
+def format_command_for_log(command):
+    """把参数列表格式化成便于直接复制执行的一行命令（仅用于日志展示）。
 
-    命令最终由 shell 执行（``shell=True``），因此整个 RTSP URL 必须加引号，
-    让 shell 把它视为一个完整的字符串——否则 URL 中的 ``?``、``&``、``=``、``@``
-    会被 shell 当作控制字符拆开，导致 ffmpeg 收到被截断的地址。
-    协议说明（《私有RTSP回放协议说明.md》第六节）也明确要求：URL 一定整体加双引号。
-
-    引号同时做转义处理，保证参数本身含引号等字符时仍能正确传递：
-    - POSIX shell：双引号包裹，内部 ``\\`` ``"`` ``$`` ``` ` `` 转义；
-    - Windows cmd：双引号包裹，内部双引号转义（cmd 不识别单引号）。
+    ffmpeg 以**参数列表**方式直接执行（不经过 shell），因此 RTSP URL 中的
+    ``?``、``&``、``=``、``@`` 等字符无需任何转义，也不会被 cmd.exe /
+    PowerShell 二次解析——这比「整条 URL 加引号后交给 shell」更可靠，
+    同时也避免了 Windows 下 cmd.exe 不识别 ``\\"`` 转义的问题。
     """
-    text = str(value)
-    if sys.platform == 'win32':
-        return '"' + text.replace('"', '\\"') + '"'
-    escaped = (
-        text.replace('\\', '\\\\')
-            .replace('"', '\\"')
-            .replace('$', '\\$')
-            .replace('`', '\\`')
-    )
-    return '"' + escaped + '"'
+    parts = [str(part) for part in command]
+    if os.name == 'nt':
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
 
 
 def summarize_ffmpeg_output(stderr, limit=1200):
@@ -241,58 +236,14 @@ def _no_recording_hint(cam_cfg, stderr):
     )
 
 
-def _terminate_process_group(process):
-    """终止 shell 及其派生的整个进程组（确保 ffmpeg 不被残留）。"""
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            process.kill()
-        except Exception:
-            pass
-    try:
-        process.communicate(timeout=5)
-    except Exception:
-        pass
-
-
-def _run_shell_command(command, timeout_seconds):
-    """在 shell 中执行命令字符串，返回 ``(returncode, stdout, stderr)``。
-
-    超时或异常时连同进程组一起终止，避免残留 ffmpeg 进程继续占用设备回放码流。
-    """
-    process = subprocess.Popen(
-        command,
-        shell=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        _terminate_process_group(process)
-        raise
-    except BaseException:
-        _terminate_process_group(process)
-        raise
-    return process.returncode, stdout, stderr
-
-
 def _ffmpeg_executable():
-    """定位 ffmpeg 可执行文件；找不到时返回 None。"""
-    exe_name = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
-    ffmpeg_path = shutil.which('ffmpeg')
-    if not ffmpeg_path:
-        if getattr(sys, 'frozen', False):
-            ffmpeg_path = os.path.join(os.path.dirname(sys.executable), exe_name)
-        else:
-            ffmpeg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', exe_name)
-    if ffmpeg_path and os.path.exists(ffmpeg_path):
-        return ffmpeg_path
-    return None
+    """定位 ffmpeg 可执行文件。
+
+    优先使用随项目分发的免安装包（``ffmpeg-win64/bin/ffmpeg.exe``），
+    其次可执行文件同级目录、内嵌打包目录，最后才是系统 PATH；
+    全部找不到时返回 None。
+    """
+    return resolve_ffmpeg_path()
 
 
 def resolve_download_timeout(cam_cfg, duration_seconds):
@@ -320,7 +271,7 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
     """
     ffmpeg_path = _ffmpeg_executable()
     if not ffmpeg_path:
-        raise RuntimeError('未找到 ffmpeg，无法通过 RTSP 下载录像。')
+        raise RuntimeError(ffmpeg_missing_hint('ffmpeg'))
 
     rtsp_url = build_playback_rtsp_url(cam_cfg, start_dt, end_dt)
     duration_seconds = max((end_dt - start_dt).total_seconds(), 1.0)
@@ -343,22 +294,23 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
         # 命令格式与《私有RTSP回放协议说明.md》完全一致：
         #   ffmpeg -nostdin -rtsp_transport tcp -timeout 5000000
         #          -i "<RTSP_URL>" -t <时长秒> -c copy -an -y "<输出.mp4>"
-        # 整个 RTSP URL 用双引号包裹（shell 执行），保证 URL 中的 ? & = @ 不被 shell 拆开；
-        # ffmpeg 路径与输出路径同样加引号，避免路径含空格等字符时被误拆。
-        command = ' '.join([
-            quote_for_shell(ffmpeg_path), '-nostdin',
+        # 以参数列表方式直接交给 ffmpeg（不经过 shell）：URL 中的 ? & = @ 天然
+        # 作为一个完整参数传递，Windows 下不会被 cmd.exe 二次解析，
+        # ffmpeg 路径与输出路径含空格/中文时也不会被误拆。
+        command = [
+            ffmpeg_path, '-nostdin',
             '-rtsp_transport', 'tcp',
             timeout_option, RTSP_SOCKET_TIMEOUT_MICROSECONDS,
-            '-i', quote_for_shell(rtsp_url),
+            '-i', rtsp_url,
             '-t', f'{duration_seconds:g}',
             '-c', 'copy',
             '-an',
-            '-y', quote_for_shell(save_path),
-        ])
-        logger.debug(f"[RTSP] 执行命令: {mask_rtsp_url(command)}")
+            '-y', save_path,
+        ]
+        logger.debug(f"[RTSP] 执行命令: {mask_rtsp_url(format_command_for_log(command))}")
 
         try:
-            returncode, _stdout, stderr = _run_shell_command(command, timeout_seconds)
+            returncode, _stdout, stderr = run_command(command, timeout_seconds)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"ffmpeg 拉取 RTSP 回放流超时（>{timeout_seconds:g} 秒）"
@@ -819,14 +771,11 @@ def transcode_video_static(input_path, output_path):
         output_path
     ]
 
-    creationflags = 0
-    if sys.platform == 'win32':
-        creationflags = subprocess.CREATE_NO_WINDOW
-
     try:
         subprocess.run(
             command, check=True, capture_output=True, text=True,
-            encoding='utf-8', timeout=300, creationflags=creationflags
+            encoding='utf-8', errors='replace', timeout=300,
+            **no_window_kwargs()
         )
         logger.debug(f"视频转码成功: {output_path}")
         return True

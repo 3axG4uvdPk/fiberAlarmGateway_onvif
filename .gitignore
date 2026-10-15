@@ -16,3 +16,7 @@ logs/
 .idea/
 .vscode/
 *.swp
+
+# Windows/Linux 随项目分发的 ffmpeg 免安装包：二进制通过 Git LFS 管理
+# （ffmpeg-win64/bin、ffmpeg-linux64/bin 由 .gitattributes 以 LFS 跟踪）。
+# 程序运行时会从该目录或系统 PATH / 环境变量 ALARM_FFMPEG_PATH 定位 ffmpeg。

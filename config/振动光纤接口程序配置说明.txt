@@ -51,8 +51,8 @@
     "path_prefix": "gxjc/test", // 上传到MinIO时的对象路径前缀
     "secure": false // 是否使用HTTPS连接
   },
-  "snapshots_dir": "/data/media/snapshots", // 本地临时存储抓拍图片的目录
-  "videos_dir": "/data/media/videos", // 本地临时存储下载视频的目录
+  "snapshots_dir": "D:/data/media/snapshots", // 本地临时存储抓拍图片的目录（Windows 路径；支持"D:/..."或"D:\\..."，也支持相对运行目录的写法如"snapshots"）
+  "videos_dir": "D:/data/media/videos", // 本地临时存储下载视频的目录（Windows 路径；同上）
 
   // ============================================================
   // 摄像机说明（重要变更）

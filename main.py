@@ -106,6 +106,8 @@ def main():
     logger.info("应用程序作为后台服务启动...")
 
     # ========== 看门狗环境检测 ==========
+    # systemd 看门狗（WatchdogSec）要求进程定期上报存活，否则被重启。
+    # 仅在 Linux + 处于 systemd 看门狗环境下启用；其他平台/独立运行不受影响。
     watchdog_process = None
     HEARTBEAT_FILE = f"/tmp/alarm_gateway_heartbeat_{os.getpid()}.tmp"
     PARENT_HEARTBEAT_TIMEOUT = 5

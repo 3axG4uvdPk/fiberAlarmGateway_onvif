@@ -60,21 +60,57 @@ DEFAULT_FIXED_CAMERA_CONFIG = {
 def get_runtime_base_dir():
     """返回运行根目录：
     - 打包为可执行文件（PyInstaller frozen）时：可执行文件所在目录
-    - 源码运行（python3 main.py）时：项目根目录
+    - 源码运行（python main.py）时：项目根目录
     """
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def normalize_runtime_path(path_value):
+    """把配置中的存储路径规范为当前平台可直接使用的路径字符串。
+
+    config.json 中允许以下三种写法，Windows 下全部可用：
+    - Windows 盘符路径：``D:/data/media/snapshots`` 或 ``D:\\data\\media\\snapshots``；
+    - UNC 网络共享：``\\\\server\\share\\media``；
+    - 无盘符的根路径（如从 Linux 配置复制而来）：``/data/media/snapshots``，
+      自动锚定到运行根目录所在盘符，即 ``D:\\data\\media\\snapshots``。
+
+    非 Windows 平台原样返回（保持原有行为）。
+    """
+    if not path_value:
+        return path_value
+    text = str(path_value).strip()
+    # 容忍配置中写成带引号的路径（如 "D:/data/media"）
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    if not text:
+        return text
+
+    if os.name != 'nt':
+        return text
+
+    # Windows：统一分隔符，避免混用正/反斜杠导致的比较、日志与外部工具解析问题
+    text = text.replace('/', '\\')
+    # 「无盘符的根路径」：\data\media -> <运行根目录所在盘符>:\data\media
+    if text.startswith('\\') and not text.startswith('\\\\'):
+        drive, _ = os.path.splitdrive(get_runtime_base_dir())
+        if drive:
+            text = drive + text
+    return os.path.normpath(text)
+
+
 def resolve_runtime_path(path_value):
-    """将配置中的路径解析为绝对路径：
-    - 绝对路径原样返回
+    """将配置中的路径解析为当前平台的绝对路径：
+    - 绝对路径（Windows 盘符 / UNC / POSIX 根路径）规范后返回
     - 相对路径基于运行根目录（打包后可执行文件目录 / 源码运行时项目根目录）解析
     """
-    if os.path.isabs(path_value):
+    if not path_value:
         return path_value
-    return os.path.abspath(os.path.join(get_runtime_base_dir(), path_value))
+    normalized = normalize_runtime_path(path_value)
+    if os.path.isabs(normalized):
+        return normalized
+    return os.path.abspath(os.path.join(get_runtime_base_dir(), normalized))
 
 
 def _load_json_file(path):
