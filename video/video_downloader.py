@@ -772,11 +772,7 @@ def transcode_video_static(input_path, output_path):
     ]
 
     try:
-        subprocess.run(
-            command, check=True, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=300,
-            **no_window_kwargs()
-        )
+        subprocess.run(command, check=True, capture_output=True, text=True,encoding='utf-8', errors='replace', timeout=300,**no_window_kwargs())
         logger.debug(f"视频转码成功: {output_path}")
         return True
     except subprocess.CalledProcessError as e:

@@ -11,6 +11,10 @@ dist/
 
 # Runtime logs
 logs/
+*.log
+
+# Release artifacts (build_release.sh 产物)
+release/
 
 # IDE / editor
 .idea/

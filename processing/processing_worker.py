@@ -13,6 +13,7 @@ import threading
 import logging
 import queue
 import collections
+import contextlib
 import itertools
 import json
 import pika
@@ -37,9 +38,12 @@ class ProcessingWorker(threading.Thread):
     """报警任务处理线程：每收到一条报警立即分发独立线程处理（多线程并发）。
 
     - 不同报警并发处理，互不阻塞；
-    - 同一报警（相同 alarm_id）通过串行槽保序，结束报警不会超越开始报警；
-    - 命中同一相机的抓图序列（转预置位→稳定等待→抓图）通过相机级序列锁
-      按到达顺序执行，不同相机完全并行。
+    - 同一报警（相同 alarm_id）只在"准备阶段"（建立上下文、预生成 URL、调度
+      告警消息，均为毫秒级）通过串行槽保序，结束报警不会超越开始报警建立上下文；
+      耗时的"抓图阶段"（云台转动等待、定焦重试等）不再占用串行槽，
+      避免结束报警的抓图被开始报警的慢速抓图整体推迟；
+    - 命中同一相机的抓图序列（转预置位→稳定等待→抓图）按到达顺序并发执行，
+      不同相机完全并行。
     """
 
     # 活跃告警上下文最长存活时间（秒），超时后强制清理，防止内存泄漏。
@@ -429,18 +433,19 @@ class ProcessingWorker(threading.Thread):
             logger.critical(f"启动报警 {alarm_id} 的处理线程失败: {e}", exc_info=True)
 
     def _run_alarm_handling(self, alarm):
-        """单条报警的处理入口：同一报警(alarm_id)串行保序 + 全局并发限流 + 异常隔离。"""
-        alarm_id = alarm.get('alarm_id')
-        if not alarm_id:
+        """单条报警的处理入口：全局并发限流 + 异常隔离。
+
+        注意：同一报警(alarm_id)的保序**只**发生在 ``_alarm_prepare_section``
+        包裹的毫秒级准备阶段（见 ``_handle_start_alarm`` / ``_handle_end_alarm``）。
+        整条报警的抓图耗时（云台转动等待 ptz_capture_wait_seconds、定焦相机
+        重试最长 FIXED_SNAPSHOT_JOIN_TIMEOUT 秒）绝不能占用同报警的串行槽，
+        否则结束报警的抓图会被开始报警的慢速抓图整体推迟。
+        """
+        if not alarm.get('alarm_id'):
             self._handle_alarm_task_guarded(alarm)
             return
-        serial_slot = self._acquire_alarm_serial_slot(alarm_id)
-        try:
-            with serial_slot['lock']:
-                with self._alarm_task_semaphore:
-                    self._handle_alarm_task_guarded(alarm)
-        finally:
-            self._release_alarm_serial_slot(alarm_id, serial_slot)
+        with self._alarm_task_semaphore:
+            self._handle_alarm_task_guarded(alarm)
 
     def _handle_alarm_task_guarded(self, alarm):
         try:
@@ -448,8 +453,22 @@ class ProcessingWorker(threading.Thread):
         except Exception as e:
             logger.critical(f"处理报警任务时发生未知错误，处理线程将继续运行: {e}", exc_info=True)
 
+    @contextlib.contextmanager
+    def _alarm_prepare_section(self, alarm_id):
+        """同一报警的"准备阶段"串行执行（毫秒级）。
+
+        只保护上下文建立、URL 预生成与告警消息调度；退出该区段后即可执行耗时的
+        抓图动作，使同一报警的结束消息不必等待开始消息抓图结束。
+        """
+        slot = self._acquire_alarm_serial_slot(alarm_id)
+        try:
+            with slot['lock']:
+                yield
+        finally:
+            self._release_alarm_serial_slot(alarm_id, slot)
+
     def _acquire_alarm_serial_slot(self, alarm_id):
-        """获取同一报警的串行槽（含等待计数），用于结束报警不被并发处理超越开始报警。"""
+        """获取同一报警的准备阶段串行槽（含等待计数），用于结束报警不被并发处理超越开始报警。"""
         with self._alarm_serial_slots_guard:
             slot = self._alarm_serial_slots.get(alarm_id)
             if slot is None:
@@ -459,7 +478,7 @@ class ProcessingWorker(threading.Thread):
             return slot
 
     def _release_alarm_serial_slot(self, alarm_id, slot):
-        """释放串行槽；无其它等待者时从字典移除，避免长期运行内存增长。"""
+        """释放准备阶段串行槽；无其它等待者时从字典移除，避免长期运行内存增长。"""
         with self._alarm_serial_slots_guard:
             slot['waiters'] -= 1
             if slot['waiters'] <= 0 and self._alarm_serial_slots.get(alarm_id) is slot:
@@ -483,16 +502,7 @@ class ProcessingWorker(threading.Thread):
             self._receive_vff(alarm_id, vff_path)
 
         if is_end_alarm:
-            active_context = self._get_active_alarm_context(alarm_id)
-            if not active_context:
-                self._remember_completed_alarm(alarm_id)
-                logger.debug(f"处理线程：忽略未知结束报警任务:{alarm_id}")
-                return
-            try:
-                self._handle_end_alarm(alarm, active_context)
-            finally:
-                self._pop_active_alarm_context(alarm_id)
-                self._remember_completed_alarm(alarm_id)
+            self._handle_end_alarm(alarm)
             return
 
         # 纯 vff 消息（无开始/结束时间）：仅投递 vff，不触发开始/结束抓图。
@@ -500,103 +510,127 @@ class ProcessingWorker(threading.Thread):
             return
 
         # 以下按开始报警处理（携带 vff 的开始消息也会正常抓图）
-        if self._get_active_alarm_context(alarm_id):
-            logger.debug(f"处理线程：忽略重复的报警任务:{alarm_id}")
-            return
-        if self._is_completed_alarm(alarm_id):
-            logger.debug(f"处理线程：忽略结束报警之后才到达的迟到开始消息:{alarm_id}")
-            return
+        self._handle_start_alarm(alarm)
 
-        # 新的开始报警：生成下游告警 ID 并建立活跃上下文。
-        # 并发处理下多个报警线程可能落在同一毫秒，追加全局自增序列保证下游 ID 唯一，
-        # 避免下游把同毫秒生成的多个报警误判为同一告警。
-        new_alarm_id_for_downstream = f'hhkj_jgld_event_{int(time.time() * 1000)}{self._next_unique_seq()}'
-        active_context = {
-            'downstream_alarm_id': new_alarm_id_for_downstream,
-            'video_url': '',
-            'camera_payloads': {},
-            'created_at': time.time(),
-        }
-        self._set_active_alarm_context(alarm_id, active_context)
+    def _handle_start_alarm(self, alarm):
+        """开始报警：串行准备阶段（毫秒级）+ 并发抓图阶段（耗时）。
 
-        tasks = self.cam_mgr._find_point_cfgs(alarm.get('point'))
-        if not tasks:
-            logger.warning(f"处理线程：报警 {alarm_id} 点位 {alarm.get('point')} 未配置，跳过抓图。")
-            if self.forward_unconfigured:
-                logger.info(f"根据配置，为未配置点位的报警 {alarm_id} 生成一条无图片信息。")
-                now = datetime.now()
-                ts = f"{now.strftime('%Y%m%d%H%M%S')}{now.microsecond // 1000:03d}"
-                message_id = f'hhkj_jgld_alarm_{ts}{self._next_unique_seq()}'
-                msg = {
-                    'messageid': message_id,
-                    'alarmid': new_alarm_id_for_downstream,
-                    'alarmlevel': '1',
-                    'alarmtime': alarm.get('start_time'),
-                    'objectposition': [],
-                    'alarmstate': '1',
-                    'boxid': self.boxid,
-                    'deviceid': 'N/A',
-                    'channelid': 'T0001',
-                    'bgimage': '',
-                    'alarmVideo': '',
-                    'alarminfo': [{'box': [], 'category': '0', 'confidence': '-1'}],
-                    'isAlarm': '1',
-                    'alarmimage': '',
-                    'remark': 'Point not configured, no snapshot taken.',
-                }
-                upload_task = {
-                    'local_path': '',
-                    'object_name': '',
-                    'mq_message': msg,
-                    '_received_at': alarm.get('_received_at'),
-                }
-                self.upload_queue.put(upload_task)
-            self._pop_active_alarm_context(alarm_id)
-            return
-
-        logger.debug(f"开始处理报警: {alarm_id}")
-        upload_tasks = []
+        抓图阶段必须脱离同一报警的准备阶段串行槽：云台转动等待
+        (ptz_capture_wait_seconds)、定焦相机重试（最长
+        FIXED_SNAPSHOT_JOIN_TIMEOUT 秒）等耗时动作若占着串行槽，
+        会把同一报警结束消息的抓图整体推迟。
+        """
+        alarm_id = alarm.get('alarm_id')
+        capture_plans = []
         all_tasks_successful = True
 
-        for cam_name, cam_cfg, preset in tasks:
-            image_url = ''
-            final_video_url = ''
-            local_file_path = ''
-            minio_object_name = ''
-            image_data = b''
-            prepared = None
-            # 抓图前先预生成图片/视频 URL、创建视频下载任务并构建告警消息，
-            # 消息立即进入延迟发送调度（从收到告警时刻起算 alarm_send_delay_seconds），
-            # 与抓图、视频下载并行处理，保证报警在配置延迟点准时发出。
-            try:
-                prepared = self._prepare_camera_task(
-                    alarm, cam_name, cam_cfg, 'start', new_alarm_id_for_downstream, ''
-                )
-                self.upload_queue.put(prepared['forward_task'])
-                logger.debug(f"报警 {alarm_id} 相机 {cam_name} 的告警消息已提前进入延迟发送调度。")
-                image_url = prepared['image_full_url']
-                final_video_url = prepared['video_full_url']
-                local_file_path = prepared['local_file_path']
-                minio_object_name = prepared['minio_object_name']
-            except Exception as e:
-                logger.error(f"报警 {alarm_id} 相机 {cam_name} 预生成告警消息任务失败: {e}", exc_info=True)
-                all_tasks_successful = False
-                # 兜底：构建无图消息仅调度推送，保证报警必达
-                self.upload_queue.put(self._build_fallback_forward_task(
-                    alarm, cam_cfg, 'start', new_alarm_id_for_downstream
-                ))
-            if final_video_url:
-                active_context['video_url'] = final_video_url
-            active_context['camera_payloads'][cam_name] = {
-                'alarmimage': image_url,
-                'alarmVideo': final_video_url,
-                'local_path': local_file_path,
-                'object_name': minio_object_name,
+        with self._alarm_prepare_section(alarm_id):
+            if self._get_active_alarm_context(alarm_id):
+                logger.debug(f"处理线程：忽略重复的报警任务:{alarm_id}")
+                return
+            if self._is_completed_alarm(alarm_id):
+                logger.debug(f"处理线程：忽略结束报警之后才到达的迟到开始消息:{alarm_id}")
+                return
+
+            # 新的开始报警：生成下游告警 ID 并建立活跃上下文。
+            # 并发处理下多个报警线程可能落在同一毫秒，追加全局自增序列保证下游 ID 唯一，
+            # 避免下游把同毫秒生成的多个报警误判为同一告警。
+            new_alarm_id_for_downstream = f'hhkj_jgld_event_{int(time.time() * 1000)}{self._next_unique_seq()}'
+            active_context = {
+                'downstream_alarm_id': new_alarm_id_for_downstream,
+                'video_url': '',
+                'camera_payloads': {},
+                'created_at': time.time(),
             }
+            self._set_active_alarm_context(alarm_id, active_context)
+
+            tasks = self.cam_mgr._find_point_cfgs(alarm.get('point'))
+            if not tasks:
+                logger.warning(f"处理线程：报警 {alarm_id} 点位 {alarm.get('point')} 未配置，跳过抓图。")
+                if self.forward_unconfigured:
+                    logger.info(f"根据配置，为未配置点位的报警 {alarm_id} 生成一条无图片信息。")
+                    now = datetime.now()
+                    ts = f"{now.strftime('%Y%m%d%H%M%S')}{now.microsecond // 1000:03d}"
+                    message_id = f'hhkj_jgld_alarm_{ts}{self._next_unique_seq()}'
+                    msg = {
+                        'messageid': message_id,
+                        'alarmid': new_alarm_id_for_downstream,
+                        'alarmlevel': '1',
+                        'alarmtime': alarm.get('start_time'),
+                        'objectposition': [],
+                        'alarmstate': '1',
+                        'boxid': self.boxid,
+                        'deviceid': 'N/A',
+                        'channelid': 'T0001',
+                        'bgimage': '',
+                        'alarmVideo': '',
+                        'alarminfo': [{'box': [], 'category': '0', 'confidence': '-1'}],
+                        'isAlarm': '1',
+                        'alarmimage': '',
+                        'remark': 'Point not configured, no snapshot taken.',
+                    }
+                    upload_task = {
+                        'local_path': '',
+                        'object_name': '',
+                        'mq_message': msg,
+                        '_received_at': alarm.get('_received_at'),
+                    }
+                    self.upload_queue.put(upload_task)
+                self._pop_active_alarm_context(alarm_id)
+                return
+
+            logger.debug(f"开始处理报警: {alarm_id}")
+            for cam_name, cam_cfg, preset in tasks:
+                image_url = ''
+                final_video_url = ''
+                local_file_path = ''
+                minio_object_name = ''
+                prepared = None
+                # 抓图前先预生成图片/视频 URL、创建视频下载任务并构建告警消息，
+                # 消息立即进入延迟发送调度（从收到告警时刻起算 alarm_send_delay_seconds），
+                # 与抓图、视频下载并行处理，保证报警在配置延迟点准时发出。
+                try:
+                    prepared = self._prepare_camera_task(
+                        alarm, cam_name, cam_cfg, 'start', new_alarm_id_for_downstream, ''
+                    )
+                    self.upload_queue.put(prepared['forward_task'])
+                    logger.debug(f"报警 {alarm_id} 相机 {cam_name} 的告警消息已提前进入延迟发送调度。")
+                    image_url = prepared['image_full_url']
+                    final_video_url = prepared['video_full_url']
+                    local_file_path = prepared['local_file_path']
+                    minio_object_name = prepared['minio_object_name']
+                except Exception as e:
+                    logger.error(f"报警 {alarm_id} 相机 {cam_name} 预生成告警消息任务失败: {e}", exc_info=True)
+                    all_tasks_successful = False
+                    # 兜底：构建无图消息仅调度推送，保证报警必达
+                    self.upload_queue.put(self._build_fallback_forward_task(
+                        alarm, cam_cfg, 'start', new_alarm_id_for_downstream
+                    ))
+                if final_video_url:
+                    active_context['video_url'] = final_video_url
+                active_context['camera_payloads'][cam_name] = {
+                    'alarmimage': image_url,
+                    'alarmVideo': final_video_url,
+                    'local_path': local_file_path,
+                    'object_name': minio_object_name,
+                }
+                capture_plans.append((cam_name, cam_cfg, preset, prepared))
+
+        # 抓图阶段（耗时）：已脱离准备阶段串行槽，不再阻塞同一报警的结束消息。
+        self._run_start_captures(alarm, active_context, capture_plans, all_tasks_successful)
+
+    def _run_start_captures(self, alarm, active_context, capture_plans, all_tasks_successful=True):
+        """开始报警抓图阶段：抓图 → 回填图片数据 → 推入异步上传队列（等待 vff 拼接）。"""
+        alarm_id = alarm.get('alarm_id')
+        upload_tasks = []
+
+        for cam_name, cam_cfg, preset, prepared in capture_plans:
+            image_data = b''
             # 抓图（与消息调度、视频下载并行），完成后回填图片数据仅上传 MinIO
             try:
                 task_result = self._process_single_camera_task(
-                    alarm, cam_name, cam_cfg, preset, 'start', new_alarm_id_for_downstream, '',
+                    alarm, cam_name, cam_cfg, preset, 'start',
+                    active_context['downstream_alarm_id'], '',
                     prebuilt=prepared,
                 )
                 image_data = task_result['image_data']
@@ -617,26 +651,54 @@ class ProcessingWorker(threading.Thread):
         if all_tasks_successful:
             logger.debug(f"报警 {alarm_id} 所有本地任务成功处理完成。")
 
-    def _handle_end_alarm(self, alarm, active_context):
-        """结束告警重新执行 PTZ/抓图，并复用开始告警阶段的视频 URL。"""
+    def _handle_end_alarm(self, alarm):
+        """结束告警：串行准备阶段（毫秒级）+ 并发抓图阶段（耗时）。
+
+        结束态抓图（转预置位 → 等待 ptz_capture_wait_seconds → 抓图）必须紧接
+        结束消息到达就启动，因此只在准备阶段（预生成 URL、调度告警消息）短暂
+        占用同报警串行槽；否则会被开始报警的慢速抓图（定焦重试 60s 等）推迟，
+        表现为结束图片晚于 end_time + ptz_capture_wait_seconds 很久才生成。
+        """
+        alarm_id = alarm.get('alarm_id')
+        capture_plans = None
+        active_context = None
+
+        with self._alarm_prepare_section(alarm_id):
+            active_context = self._get_active_alarm_context(alarm_id)
+            if not active_context:
+                self._remember_completed_alarm(alarm_id)
+                logger.debug(f"处理线程：忽略未知结束报警任务:{alarm_id}")
+                return
+            if active_context.get('end_in_progress'):
+                logger.debug(f"处理线程：忽略重复的结束报警任务:{alarm_id}")
+                return
+            active_context['end_in_progress'] = True
+            capture_plans = self._prepare_end_alarm_captures(alarm, active_context)
+
+        try:
+            if capture_plans:
+                self._run_end_captures(alarm, active_context, capture_plans)
+        finally:
+            self._pop_active_alarm_context(alarm_id)
+            self._remember_completed_alarm(alarm_id)
+
+    def _prepare_end_alarm_captures(self, alarm, active_context):
+        """结束告警准备阶段：预生成结束态图片 URL、构建并调度结束告警消息。
+
+        消息立即进入延迟发送调度（从收到结束告警时刻起算），与结束态抓图并行，
+        保证结束报警在配置延迟点准时发出。返回抓图计划列表；点位未配置时返回空列表。
+        """
         alarm_id = alarm.get('alarm_id')
         tasks = self.cam_mgr._find_point_cfgs(alarm.get('point'))
-
         if not tasks:
             logger.warning(f"处理线程：结束报警 {alarm_id} 点位 {alarm.get('point')} 未配置，跳过发送。")
-            return
+            return []
 
-        for cam_name, cam_cfg, _preset in tasks:
+        capture_plans = []
+        for cam_name, cam_cfg, preset in tasks:
             camera_payload = active_context.get('camera_payloads', {}).get(cam_name, {})
-            image_url = ''
-            local_file_path = ''
-            minio_object_name = ''
-            image_data = b''
             video_url = camera_payload.get('alarmVideo', active_context.get('video_url', ''))
             prepared = None
-            # 抓图前先预生成结束态图片 URL 并构建结束告警消息，
-            # 消息立即进入延迟发送调度（从收到结束告警时刻起算），
-            # 与结束态抓图并行处理，保证结束报警在配置延迟点准时发出。
             try:
                 prepared = self._prepare_camera_task(
                     alarm, cam_name, cam_cfg, 'end',
@@ -644,9 +706,6 @@ class ProcessingWorker(threading.Thread):
                 )
                 self.upload_queue.put(prepared['forward_task'])
                 logger.debug(f"结束报警 {alarm_id} 相机 {cam_name} 的告警消息已提前进入延迟发送调度。")
-                image_url = prepared['image_full_url']
-                local_file_path = prepared['local_file_path']
-                minio_object_name = prepared['minio_object_name']
                 video_url = prepared['video_full_url']
             except Exception as e:
                 logger.error(f"处理结束报警 {alarm_id} 的相机 {cam_name} 任务时发生错误: {e}", exc_info=True)
@@ -654,10 +713,18 @@ class ProcessingWorker(threading.Thread):
                 self.upload_queue.put(self._build_fallback_forward_task(
                     alarm, cam_cfg, 'end', active_context['downstream_alarm_id']
                 ))
+            capture_plans.append((cam_name, cam_cfg, preset, prepared, video_url))
+        return capture_plans
+
+    def _run_end_captures(self, alarm, active_context, capture_plans):
+        """结束告警抓图阶段：重新转预置位抓图 → 回填图片数据 → 推入异步上传队列。"""
+        alarm_id = alarm.get('alarm_id')
+        for cam_name, cam_cfg, preset, prepared, video_url in capture_plans:
+            image_data = b''
             # 结束态抓图（与消息调度并行），完成后回填图片数据仅上传 MinIO
             try:
                 task_result = self._process_single_camera_task(
-                    alarm, cam_name, cam_cfg, _preset, 'end',
+                    alarm, cam_name, cam_cfg, preset, 'end',
                     active_context['downstream_alarm_id'], video_url,
                     prebuilt=prepared,
                 )
@@ -669,7 +736,7 @@ class ProcessingWorker(threading.Thread):
                 self.upload_queue.put(prepared['upload_task'])
             logger.debug(f"已为相机 {cam_name} 生成结束告警待上传任务 (结束态重新抓图是否就绪: {bool(image_data)})")
 
-        logger.debug(f"结束报警 {alarm_id} 已生成 {len(tasks)} 条带结束态图片的延迟转发任务。")
+        logger.debug(f"结束报警 {alarm_id} 已生成 {len(capture_plans)} 条带结束态图片的延迟转发任务。")
 
     def _prepare_camera_task(self, alarm, cam_name, cam_cfg, alarm_state, downstream_alarm_id, existing_video_url=''):
         """抓图前预生成图片/视频 URL、创建视频下载任务并构建告警消息任务。
