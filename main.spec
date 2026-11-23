@@ -35,6 +35,7 @@ a = Analysis(
         'camera.camera_manager',
         'camera.onvif_camera',
         'core',
+        'core.alarm_utils',
         'core.config',
         'core.ffmpeg_utils',
         'core.logging_config',

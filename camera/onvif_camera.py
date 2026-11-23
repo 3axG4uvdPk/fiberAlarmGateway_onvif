@@ -4,7 +4,8 @@ ONVIF 摄像机操作模块（抓图 / 云台预置位）。
 
 统一通过 ONVIF 标准协议操作摄像机，不再依赖任何厂家私有 SDK：
 - 抓图：``GetProfiles`` → ``GetSnapshotUri`` → 用 **httpx** 拉取图片字节流
-  （依次尝试 Digest 认证、Basic 认证、匿名）；
+  （依次尝试 Digest 认证、Basic 认证、匿名）；快照地址为 ``https://`` 时
+  默认降级为 ``http://`` 再下载（见 :data:`FORCE_HTTP_SNAPSHOT`）；
 - 云台预置位：``PTZ GotoPreset``；
 - 会话探测：``GetProfiles``（用于启动期预连接与诊断）。
 
@@ -36,7 +37,13 @@ DEFAULT_SNAPSHOT_TIMEOUT_SECONDS = 20.0
 # 单次 ONVIF 会话建立（update_xaddrs）超时（秒）
 DEFAULT_ONVIF_CONNECT_TIMEOUT_SECONDS = 15.0
 
-# 日志里脱敏 RTSP/HTTP URL 中的密码：scheme://user:pass@ -> scheme://user:***@
+# 是否强制把快照地址的 https:// 降级为 http://。
+# 部分摄像机 HTTPS 实现不规范（TLS 握手失败），改走 HTTP 可绕开该问题；
+# 设为 False 则按设备返回的原始协议下载。
+FORCE_HTTP_SNAPSHOT = True
+
+# 去除 URL 中的 user:pass@ 片段（认证改由 httpx auth 参数携带）：
+# scheme://user:pass@host -> scheme://host
 _URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)(?P<user>[^:/@\s]+):(?P<pwd>[^@/\s]*)@")
 
 
@@ -77,13 +84,6 @@ def _onvif_camera_class():
 
         _ONVIF_CAMERA_CLASS = ONVIFCamera
         return _ONVIF_CAMERA_CLASS
-
-
-def mask_url_credentials(url):
-    """将 URL 中的密码替换为 ``***``，便于安全打印日志。"""
-    if not url:
-        return url
-    return _URL_CREDENTIALS_RE.sub(r"\g<scheme>\g<user>:***@", str(url))
 
 
 # =====================================================================
@@ -396,6 +396,13 @@ def _strip_url_credentials(url):
     return _URL_CREDENTIALS_RE.sub(r"\g<scheme>", url, count=1)
 
 
+def _to_http_url(url):
+    """把 ``https://`` 快照地址降级为 ``http://``（FORCE_HTTP_SNAPSHOT 开启时）。"""
+    if FORCE_HTTP_SNAPSHOT and url.lower().startswith('https://'):
+        return 'http://' + url[len('https://'):]
+    return url
+
+
 async def _fetch_snapshot(uri, user, pwd, preferred=None, timeout=DEFAULT_SNAPSHOT_TIMEOUT_SECONDS):
     """用 httpx 拉取快照图片字节流，返回 ``(图片数据, 认证方式)``。
 
@@ -405,7 +412,10 @@ async def _fetch_snapshot(uri, user, pwd, preferred=None, timeout=DEFAULT_SNAPSH
     """
     import httpx
 
-    request_url = _strip_url_credentials(uri)
+    stripped_url = _strip_url_credentials(uri)
+    request_url = _to_http_url(stripped_url)
+    if request_url != stripped_url:
+        logger.info(f"已将快照地址从 HTTPS 降级为 HTTP：{request_url}")
     order = []
     if preferred:
         order.append(preferred)
@@ -435,7 +445,7 @@ async def _fetch_snapshot(uri, user, pwd, preferred=None, timeout=DEFAULT_SNAPSH
             if response.is_success and response.content:
                 return response.content, mode
             last_error = f"HTTP {response.status_code}"
-    raise OnvifError(f"拉取快照失败（{mask_url_credentials(request_url)}）: {last_error}")
+    raise OnvifError(f"拉取快照失败（{request_url}）: {last_error}")
 
 
 async def _snapshot(cam_cfg):

@@ -5,7 +5,7 @@
   "vff_wait_timeout_seconds": 30,
   "ptz_capture_wait_seconds": 10,
   "heartbeat": {
-    "url": "http://172.16.61.59:9090/boxStatucService/boxStatus/add",
+    "url": "http://172.16.61.177:9090/boxStatucService/boxStatus/add",
     "interval_seconds": 30,
     "status_timeout_seconds": 60
   },
@@ -20,7 +20,7 @@
   },
   "rabbitmq_status_in": {
     "url": "amqp://admin:hhkj1234@172.16.61.130:5672/",
-    "exchange_in": "das.data",
+    "exchange_in": "das.state",
     "exchange_type": "fanout",
     "queue_name": "",
     "routing_key": "",
@@ -44,7 +44,7 @@
     "forward_enabled": true
   },
   "minio": {
-    "endpoint": "172.16.61.59:9000",
+    "endpoint": "172.16.61.177:9000",
     "access_key": "minioadmin",
     "secret_key": "minioadmin",
     "bucket_name": "hhkj",
@@ -55,7 +55,7 @@
   "videos_dir": "/data/media/videos",
   "cameras": {
     "cam2": {
-      "ip": "172.16.61.109",
+      "ip": "172.16.61.108",
       "username": "admin",
       "pwd": "HHkj1994",
       "manufacturer": "dahua",
@@ -64,27 +64,39 @@
       "channel": 1,
       "stream_type": 1,
       "rtsp_port": 554,
-      "download_delay_seconds": 20,
+      "download_delay_seconds": 40,
       "video_download_before_seconds": 15,
       "video_download_after_seconds": 15,
       "fixed_camera": {
-        "enabled": false,
-        "ip": "172.16.61.64",
+        "enabled": true,
+        "ip": "172.16.61.13",
         "username": "admin",
-        "pwd": "Hhkj1994",
-        "manufacturer": "hikvision",
+        "pwd": "admin1234.",
+        "manufacturer": "uniview",
         "onvif_port": 80,
         "channel": 1,
         "stream_type": 1
       }
     }
   },
-  "points": {
-    "1-1": { "camera": "cam2", "preset": 2 },
-    "2-2": { "camera": "cam2", "preset": 3 },
-    "3-3": { "camera": "cam2", "preset": 4 },
-    "4-4": { "camera": "cam2", "preset": 5 },
-    "5-5": { "camera": "cam2", "preset": 2 },
-    "6-10": { "camera": "cam2", "preset": 3 }
+  "deviceid_channel_points": {
+    "fbg-001": {
+      "1": {
+        "1-1": { "camera": "cam2", "preset": 2 },
+        "2-2": { "camera": "cam2", "preset": 3 },
+        "3-3": { "camera": "cam2", "preset": 4 },
+        "4-4": { "camera": "cam2", "preset": 5 },
+        "5-5": { "camera": "cam2", "preset": 2 },
+        "6-1000": { "camera": "cam2", "preset": 3 }
+      },
+      "0": {
+        "1-1": { "camera": "cam2", "preset": 1 },
+        "2-2": { "camera": "cam2", "preset": 2 },
+        "3-3": { "camera": "cam2", "preset": 3 },
+        "4-4": { "camera": "cam2", "preset": 4 },
+        "5-5": { "camera": "cam2", "preset": 5 },
+        "6-10": { "camera": "cam2", "preset": 3 }
+      }
+    }
   }
 }

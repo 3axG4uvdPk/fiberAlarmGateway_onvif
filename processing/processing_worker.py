@@ -7,15 +7,17 @@
 """
 import os
 import time
+import base64
+import binascii
 import shutil
 import subprocess
+import tempfile
 import threading
 import logging
 import queue
 import collections
 import contextlib
 import itertools
-import json
 import pika
 from datetime import datetime
 
@@ -54,8 +56,10 @@ class ProcessingWorker(threading.Thread):
     MAX_CAPTURE_ATTEMPTS = 50
     # 定焦抓图线程等待完成的最长时间（秒）。
     FIXED_SNAPSHOT_JOIN_TIMEOUT = 60
-    # 等待vff_path图片超时放弃时间（秒），默认30秒。
-    VFF_WAIT_TIMEOUT_SECONDS = 30
+    # 等待上游 image（base64 PNG 定位图片）的超时秒数，默认30秒。
+    IMAGE_WAIT_TIMEOUT_SECONDS = 30
+    # 已到达但尚无等待中开始报警的上游图片缓存上限（单张图片解码后可达数 MB）。
+    MAX_ARRIVED_IMAGES = 128
     # 同时处理的报警任务数上限，防止告警洪峰时线程无界膨胀。
     MAX_CONCURRENT_ALARM_TASKS = 80
 
@@ -82,8 +86,13 @@ class ProcessingWorker(threading.Thread):
             logger.warning(ffmpeg_missing_hint('ffmpeg'))
         if not self.ffprobe_path:
             logger.warning(ffmpeg_missing_hint('ffprobe'))
-        self.vff_wait_timeout_seconds = self._parse_vff_wait_timeout(
-            self.config.get('vff_wait_timeout_seconds', self.VFF_WAIT_TIMEOUT_SECONDS)
+        # 等待上游 image 图片的时长：优先 image_wait_timeout_seconds，
+        # 兼容历史配置项 vff_wait_timeout_seconds。
+        self.image_wait_timeout_seconds = self._parse_image_wait_timeout(
+            self.config.get(
+                'image_wait_timeout_seconds',
+                self.config.get('vff_wait_timeout_seconds', self.IMAGE_WAIT_TIMEOUT_SECONDS),
+            )
         )
         self._is_running = True
 
@@ -98,14 +107,19 @@ class ProcessingWorker(threading.Thread):
         # 已结束（或已超时清理）的告警 ID，用于过滤结束报警之后才到达的迟到开始消息
         self._completed_alarms = collections.OrderedDict()
 
-        # 等待 vff 图片的待发送开始报警（alarm_id -> {'tasks': [...], 'timer': Timer}）
-        self._pending_vff_alarms = {}
-        # 同时作为 _arrived_vff_paths 的锁，保证提前缓存与登记等待的原子性
-        self._pending_vff_lock = threading.RLock()
+        # 已由接收线程提前处理 image 的报警 ID（LRU）。仅作为内部去重状态，
+        # 不写入报警消息本身，避免内部字段污染协议数据与日志。
+        self._early_image_handled = collections.OrderedDict()
+        self._early_image_handled_lock = threading.Lock()
 
-        # 接收线程提前投递的 vff 图片路径缓存（alarm_id -> (vff_path, arrived_at)），
-        # 在开始报警完成抓图登记等待时原子消费，避免 vff 先于登记到达被丢弃。
-        self._arrived_vff_paths = {}
+        # 等待上游 image 图片的待发送开始报警（alarm_id -> {'tasks': [...], 'timer': Timer}）
+        self._pending_image_alarms = {}
+        # 同时作为 _arrived_images 的锁，保证提前缓存与登记等待的原子性
+        self._pending_image_lock = threading.RLock()
+
+        # 接收线程提前投递的图片缓存（alarm_id -> (image_bytes, arrived_at)），
+        # 在开始报警完成抓图登记等待时原子消费，避免 image 先于登记到达被丢弃。
+        self._arrived_images = collections.OrderedDict()
 
         # 是否转发未配置点位的报警
         self.forward_unconfigured = self.config.get('forward_unconfigured_alarms', False)
@@ -124,6 +138,7 @@ class ProcessingWorker(threading.Thread):
         if self.boxid == "UNKNOWN_BOX":
             logger.warning("配置文件中未找到 'boxid'，将使用默认值 'UNKNOWN_BOX'。")
         self._log_fixed_camera_config()
+        self._log_point_mapping()
 
     def _log_fixed_camera_config(self):
         """启动时逐台打印定焦相机的启用情况。"""
@@ -138,6 +153,28 @@ class ProcessingWorker(threading.Thread):
             if enabled:
                 logger.info(
                     f"相机 {cam_name} ({cam_cfg.get('ip')}) 的定焦摄像机已启用: {fixed_cfg['ip']}"
+                )
+
+    def _log_point_mapping(self):
+        """启动时打印按【设备ID + 通道号 + 点位区间】配置的联动规则，便于现场核对。"""
+        mapping = self.config.get('deviceid_channel_points')
+        if not isinstance(mapping, dict) or not mapping:
+            logger.warning("配置中未定义 deviceid_channel_points，所有报警都将被视为未配置点位。")
+            return
+        for device_id, channels in mapping.items():
+            if not isinstance(channels, dict):
+                continue
+            for channel, point_ranges in channels.items():
+                if not isinstance(point_ranges, dict):
+                    continue
+                rules = []
+                for rng, info in point_ranges.items():
+                    if isinstance(info, dict):
+                        rules.append(
+                            f"{rng}->{info.get('camera')}@预设位{info.get('preset', -1)}"
+                        )
+                logger.info(
+                    f"点位联动规则: 设备={device_id} 通道={channel}: {', '.join(rules) or '(空)'}"
                 )
 
     def _resolve_fixed_camera(self, cam_cfg):
@@ -169,11 +206,14 @@ class ProcessingWorker(threading.Thread):
         return fixed_cfg, True
 
     @staticmethod
-    def _parse_vff_wait_timeout(raw_value):
+    def _parse_image_wait_timeout(raw_value):
         try:
             return max(float(raw_value or 0), 0.0)
         except (TypeError, ValueError):
-            logger.warning(f"无效的 vff_wait_timeout_seconds 配置: {raw_value}，已回退为 30 秒。")
+            logger.warning(
+                f"无效的 image_wait_timeout_seconds / vff_wait_timeout_seconds 配置: "
+                f"{raw_value}，已回退为 30 秒。"
+            )
             return 30.0
 
     def stop(self):
@@ -214,110 +254,257 @@ class ProcessingWorker(threading.Thread):
         with self._active_alarms_lock:
             return alarm_id in self._completed_alarms
 
-    def _receive_vff(self, alarm_id, vff_path):
-        """投递 vff 图片：若存在等待中的开始报警则立即拼接发送。
+    def mark_image_handled(self, alarm_id):
+        """登记“接收线程已提前处理 image”的报警 ID（仅内部状态，不修改报警消息）。"""
+        if not alarm_id:
+            return
+        with self._early_image_handled_lock:
+            self._early_image_handled[alarm_id] = True
+            while len(self._early_image_handled) > self.COMPLETED_ALARMS_MAX:
+                self._early_image_handled.popitem(last=False)
+
+    def is_image_handled(self, alarm_id):
+        """查询 image 是否已由接收线程提前处理，避免处理线程重复解码。"""
+        if not alarm_id:
+            return False
+        with self._early_image_handled_lock:
+            return alarm_id in self._early_image_handled
+
+    def _receive_image(self, alarm_id, image_bytes):
+        """投递上游 image 图片：若存在等待中的开始报警则立即拼接发送。
 
         若尚无等待中的开始报警（开始报警仍在抓图尚未登记、或本条消息本身同时携带
-        start_time+vff_path 且是第一次到达），则先将 vff 路径缓存进 _arrived_vff_paths，
-        供开始报警登记等待时原子消费拼接；绝不能把已到达的 vff 直接丢弃，
-        否则携带 start_time+vff_path 的单条告警消息（无后续独立 vff 消息）会等满
-        vff_wait_timeout 后以未拼接图片发送，导致开始图片永远缺 vff 拼图。
+        start_time+image 且是第一次到达），则先将图片缓存进 _arrived_images，
+        供开始报警登记等待时原子消费拼接；绝不能把已到达的图片直接丢弃，
+        否则携带 start_time+image 的单条告警消息（无后续独立图片消息）会等满
+        image_wait_timeout_seconds 后以未拼接图片发送。
         返回是否命中并处理了等待中的开始报警。
         """
-        if not alarm_id or not vff_path:
+        if not alarm_id or not image_bytes:
             return False
-        pending = self._claim_pending_vff(alarm_id)
+        pending = self._claim_pending_image(alarm_id)
         if pending is not None:
             timer = pending.get('timer')
             if timer is not None:
                 timer.cancel()
-            logger.debug(f"处理线程命中已等待的开始报警 {alarm_id}，立即拼接 vff: {vff_path}")
-            self._append_vff_to_tasks(pending['tasks'], vff_path)
+            logger.debug(
+                f"处理线程命中已等待的开始报警 {alarm_id}，立即拼接 image"
+                f"（{len(image_bytes)} 字节）。"
+            )
+            self._append_image_to_tasks(pending['tasks'], image_bytes)
             self._dispatch_tasks(alarm_id, pending['tasks'])
             return True
-        with self._pending_vff_lock:
-            if alarm_id not in self._arrived_vff_paths:
-                self._arrived_vff_paths[alarm_id] = (vff_path, time.time())
-        logger.debug(f"收到 vff_path 但尚无等待中的开始报警，已缓存待登记时拼接: {alarm_id} -> {vff_path}")
+        if self._is_completed_alarm(alarm_id):
+            logger.debug(f"报警 {alarm_id} 已结束，忽略迟到的 image 图片。")
+            return False
+        self._cache_arrived_image(alarm_id, image_bytes)
+        logger.debug(
+            f"收到 image 但尚无等待中的开始报警，已缓存待登记时拼接: {alarm_id}"
+            f"（{len(image_bytes)} 字节）"
+        )
         return False
 
-    def deliver_vff_early(self, alarm_id, vff_path):
-        """接收线程在入队前直接调用：若该报警已登记等待 vff（开始报警已处理完、尚未超时），
-        则直接在接收线程拼接，避免依赖处理线程从队列取到 vff 消息而错过等待超时；
-        否则将 vff 路径缓存，供开始报警登记时原子消费。"""
-        if not alarm_id or not vff_path:
-            return
-        with self._pending_vff_lock:
-            # 原子取回等待条目，防止与超时/其他线程并发重复发送。
-            pending = self._pending_vff_alarms.pop(alarm_id, None)
-            if pending is not None:
-                timer = pending.get('timer')
-                if timer is not None:
-                    timer.cancel()
-                logger.debug(
-                    f"接收线程命中已等待的开始报警 {alarm_id}，直接拼接 vff: {vff_path}"
-                )
-                self._append_vff_to_tasks(pending['tasks'], vff_path)
-                self._dispatch_tasks(alarm_id, pending['tasks'])
-                return
-            self._arrived_vff_paths[alarm_id] = (vff_path, time.time())
-        logger.debug(f"接收线程提前缓存 vff 路径: {alarm_id} -> {vff_path}")
+    def deliver_image_early(self, alarm_id, image_base64):
+        """接收线程在入队前直接调用：若该报警已登记等待 image（开始报警已处理完、尚未超时），
+        则立即拼接发送，避免依赖处理线程从队列取到图片消息而错过等待超时；
+        否则将图片解码后缓存，供开始报警登记时原子消费。
 
-    def _register_pending_vff(self, alarm_id, tasks):
-        """登记等待 vff 图片的开始报警任务，超时后按无 vff 直接发送。"""
+        返回该图片是否已处理（命中等待 / 已缓存 / 已结束忽略），供接收线程标记消息，
+        避免处理线程重复解码同一张 base64 图片（数 MB 级）。
+        """
+        if not alarm_id or not image_base64:
+            return False
+        if self._is_completed_alarm(alarm_id):
+            logger.debug(f"报警 {alarm_id} 已结束，忽略迟到的 image 图片。")
+            return True
+        with self._pending_image_lock:
+            if alarm_id in self._arrived_images:
+                logger.debug(f"报警 {alarm_id} 的 image 已缓存，忽略重复图片消息。")
+                return True
+
+        image_bytes = self._decode_alarm_image(image_base64)
+        if not image_bytes:
+            return False
+
+        with self._pending_image_lock:
+            # 原子取回等待条目，防止与超时/其他线程并发重复发送。
+            pending = self._pending_image_alarms.pop(alarm_id, None)
+            if pending is None:
+                self._cache_arrived_image_locked(alarm_id, image_bytes)
+
+        if pending is None:
+            logger.debug(
+                f"接收线程提前缓存 image: {alarm_id}（{len(image_bytes)} 字节）"
+            )
+            return True
+
+        timer = pending.get('timer')
+        if timer is not None:
+            timer.cancel()
+        logger.debug(
+            f"接收线程命中已等待的开始报警 {alarm_id}，直接拼接 image"
+            f"（{len(image_bytes)} 字节）。"
+        )
+        # 拼接需要调用 ffmpeg（耗时），放到独立线程执行，避免阻塞 MQ 接收线程，
+        # 保证不同设备/通道/点位的新报警仍能被及时消费。
+        self._append_image_and_dispatch_async(alarm_id, pending['tasks'], image_bytes)
+        return True
+
+    def _register_pending_image(self, alarm_id, tasks):
+        """登记等待上游 image 的开始报警任务，超时后按无 image 直接发送。"""
         cached = None
-        with self._pending_vff_lock:
-            cached = self._arrived_vff_paths.pop(alarm_id, None)
-            if cached is None:
+        timer = None
+        with self._pending_image_lock:
+            cached = self._arrived_images.pop(alarm_id, None)
+            if cached is None and self.image_wait_timeout_seconds > 0:
                 timer = threading.Timer(
-                    self.vff_wait_timeout_seconds,
-                    self._on_vff_timeout,
+                    self.image_wait_timeout_seconds,
+                    self._on_image_timeout,
                     args=(alarm_id,),
                 )
                 timer.daemon = True
-                self._pending_vff_alarms[alarm_id] = {'tasks': tasks, 'timer': timer}
+                self._pending_image_alarms[alarm_id] = {'tasks': tasks, 'timer': timer}
         if cached is not None:
-            early_vff_path = cached[0]
-            logger.debug(f"报警 {alarm_id} 登记时消费已提前到达的 vff，立即拼接。")
-            self._append_vff_to_tasks(tasks, early_vff_path)
+            image_bytes = cached[0]
+            logger.debug(f"报警 {alarm_id} 登记时消费已提前到达的 image，立即拼接。")
+            self._append_image_to_tasks(tasks, image_bytes)
+            self._dispatch_tasks(alarm_id, tasks)
+            return
+        if timer is None:
+            # 未配置等待时长（<=0）：不登记等待，直接发送未拼接图片
             self._dispatch_tasks(alarm_id, tasks)
             return
         logger.debug(
-            f"报警 {alarm_id} 等待 vff 图片，超时 {self.vff_wait_timeout_seconds:g} 秒后放弃等待。"
+            f"报警 {alarm_id} 等待上游 image 图片，超时 "
+            f"{self.image_wait_timeout_seconds:g} 秒后放弃等待。"
         )
         timer.start()
 
-    def _claim_pending_vff(self, alarm_id):
-        """原子地取出待处理的 vff 等待条目，避免超时与到账并发重复发送。"""
-        with self._pending_vff_lock:
-            return self._pending_vff_alarms.pop(alarm_id, None)
+    def _claim_pending_image(self, alarm_id):
+        """原子地取出待处理的 image 等待条目，避免超时与到账并发重复发送。"""
+        with self._pending_image_lock:
+            return self._pending_image_alarms.pop(alarm_id, None)
 
-    def _on_vff_timeout(self, alarm_id):
-        """vff 等待超时，直接发送未拼接 vff 的开始图片。"""
-        pending = self._claim_pending_vff(alarm_id)
+    def _on_image_timeout(self, alarm_id):
+        """image 等待超时，直接发送未拼接图片的开始报警。"""
+        pending = self._claim_pending_image(alarm_id)
         if pending is None:
             return
-        logger.debug(f"报警 {alarm_id} 等待 vff 超时，直接发送未拼接图片。")
+        logger.debug(f"报警 {alarm_id} 等待 image 超时，直接发送未拼接图片。")
         self._dispatch_tasks(alarm_id, pending['tasks'])
 
-    def _append_vff_to_tasks(self, tasks, vff_path):
-        """将 vff 图片拼接到每条开始报警任务的图片下方。"""
-        for task in tasks:
-            local_path = task.get('local_path')
-            if not local_path or not os.path.exists(local_path):
-                logger.warning(f"开始图片不存在，无法拼接 vff: {local_path}")
-                continue
+    def _cache_arrived_image_locked(self, alarm_id, image_bytes):
+        """在已持有 _pending_image_lock 的前提下缓存已到达的图片（有上限，淘汰最旧）。"""
+        if alarm_id in self._arrived_images:
+            return
+        self._arrived_images[alarm_id] = (image_bytes, time.time())
+        while len(self._arrived_images) > self.MAX_ARRIVED_IMAGES:
+            dropped_id, _ = self._arrived_images.popitem(last=False)
+            logger.warning(
+                f"上游 image 缓存已达上限 ({self.MAX_ARRIVED_IMAGES})，"
+                f"丢弃最旧的报警图片: {dropped_id}"
+            )
+
+    def _cache_arrived_image(self, alarm_id, image_bytes):
+        """缓存已到达但尚无等待中开始报警的图片。"""
+        with self._pending_image_lock:
+            self._cache_arrived_image_locked(alarm_id, image_bytes)
+
+    def _discard_cached_image(self, alarm_id):
+        """丢弃某条报警已缓存但未消费的上游图片，避免内存长期占用。"""
+        if not alarm_id:
+            return
+        with self._pending_image_lock:
+            self._arrived_images.pop(alarm_id, None)
+
+    def _append_image_to_tasks(self, tasks, image_bytes):
+        """将上游 image 图片（PNG）拼接到每条开始报警任务的图片下方。"""
+        image_path = self._write_temp_image(image_bytes)
+        if not image_path:
+            return
+        try:
+            for task in tasks:
+                local_path = task.get('local_path')
+                if not local_path or not os.path.exists(local_path):
+                    logger.warning(f"开始图片不存在，无法拼接 image: {local_path}")
+                    continue
+                try:
+                    before_h = self._probe_image_height(local_path)
+                    self._append_image_below(local_path, image_path, local_path)
+                    task['image_data'] = self._read_image_file(local_path, 'image拼接图片')
+                    after_w, after_h = self._probe_image_dim(local_path)
+                    logger.debug(
+                        f"已将 image 拼接至开始图片: {local_path} "
+                        f"(image: {len(image_bytes)} 字节, 拼接前高: {before_h}, "
+                        f"拼接后: {after_w}x{after_h})"
+                    )
+                except Exception as e:
+                    logger.error(f"拼接 image 到开始图片失败，将保留未拼接图片: {e}", exc_info=True)
+        finally:
+            self._safe_remove_file(image_path)
+
+    def _append_image_and_dispatch_async(self, alarm_id, tasks, image_bytes):
+        """异步拼接 image 并推送任务，避免在 MQ 接收线程中执行耗时的 ffmpeg 拼接。"""
+        def _worker():
             try:
-                before_h = self._probe_image_height(local_path)
-                self._append_vff_below(local_path, vff_path, local_path)
-                task['image_data'] = self._read_image_file(local_path, 'vff拼接图片')
-                after_w, after_h = self._probe_image_dim(local_path)
-                logger.debug(
-                    f"已将 vff 拼接至开始图片: {local_path} "
-                    f"(vff源: {vff_path}, 拼接前高: {before_h}, 拼接后: {after_w}x{after_h})"
-                )
-            except Exception as e:
-                logger.error(f"拼接 vff 到开始图片失败，将保留未拼接图片: {e}", exc_info=True)
+                self._append_image_to_tasks(tasks, image_bytes)
+            except Exception as exc:
+                logger.error(f"报警 {alarm_id} 拼接 image 时发生异常: {exc}", exc_info=True)
+            finally:
+                self._dispatch_tasks(alarm_id, tasks)
+
+        try:
+            threading.Thread(
+                target=_worker, daemon=True, name=f"ImageAttach-{alarm_id}"
+            ).start()
+        except Exception as exc:
+            logger.error(f"启动 image 拼接线程失败，改为当前线程执行: {exc}")
+            _worker()
+
+    @staticmethod
+    def _decode_alarm_image(image_base64):
+        """解码上游 image 字段（base64 编码的 PNG 图片数据），失败返回 None。"""
+        if not image_base64:
+            return None
+        try:
+            text = str(image_base64).strip()
+            # 容忍 data:image/png;base64,<data> 形式的写法
+            if text.startswith('data:') and ',' in text:
+                text = text.split(',', 1)[1]
+            # 容忍 base64 文本中的换行/空白字符
+            text = ''.join(text.split())
+            if not text:
+                return None
+            padding = (-len(text)) % 4
+            if padding:
+                text += '=' * padding
+            image_bytes = base64.b64decode(text, validate=False)
+        except (binascii.Error, TypeError) as exc:
+            logger.error(f"解析报警 image 字段（base64）失败: {exc}")
+            return None
+        if not image_bytes:
+            logger.error("报警 image 字段解码后为空。")
+            return None
+        return image_bytes
+
+    def _write_temp_image(self, image_bytes):
+        """把解码后的图片写入临时 PNG 文件，返回文件路径（失败返回空字符串）。
+
+        临时文件放在 snapshots_dir 下的 .tmp 子目录（磁盘存储），而不是系统 /tmp，
+        避免解码后的图片占满根分区（部分盒子 /tmp 位于 RAM/tmpfs）。
+        """
+        if not image_bytes:
+            return ''
+        tmp_dir = os.path.join(self.snapshots_dir, '.tmp')
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix='alarm_image_', suffix='.png', dir=tmp_dir)
+            with os.fdopen(fd, 'wb') as image_file:
+                image_file.write(image_bytes)
+            return path
+        except OSError as exc:
+            logger.error(f"写入上游告警图片（image）临时文件失败: {exc}")
+            return ''
 
     def _dispatch_tasks(self, alarm_id, tasks):
         """将最终任务推入异步上传队列。"""
@@ -333,19 +520,20 @@ class ProcessingWorker(threading.Thread):
                 created_at = context.get('created_at') or 0
                 if now - created_at > self.ACTIVE_CONTEXT_TTL_SECONDS:
                     stale_ids.append(alarm_id)
-        expired_vff = 0
-        vff_ttl = max(10.0 * self.vff_wait_timeout_seconds, 300.0)
-        with self._pending_vff_lock:
-            for key, (_path, arrived_at) in list(self._arrived_vff_paths.items()):
-                if now - arrived_at > vff_ttl:
-                    self._arrived_vff_paths.pop(key, None)
-                    expired_vff += 1
-        if expired_vff:
-            logger.debug(f"清理 {expired_vff} 条超时未消费的 vff 提前投递缓存。")
+        expired_images = 0
+        image_ttl = max(10.0 * self.image_wait_timeout_seconds, 300.0)
+        with self._pending_image_lock:
+            for key, (_image, arrived_at) in list(self._arrived_images.items()):
+                if now - arrived_at > image_ttl:
+                    self._arrived_images.pop(key, None)
+                    expired_images += 1
+        if expired_images:
+            logger.debug(f"清理 {expired_images} 条超时未消费的上游图片（image）提前投递缓存。")
 
         for alarm_id in stale_ids:
             self._pop_active_alarm_context(alarm_id)
             self._remember_completed_alarm(alarm_id)
+            self._discard_cached_image(alarm_id)
             logger.warning(
                 f"告警 {alarm_id} 在 {self.ACTIVE_CONTEXT_TTL_SECONDS} 秒内未收到结束报警，"
                 f"已强制清理其上下文（防止内存泄漏）。"
@@ -493,23 +681,32 @@ class ProcessingWorker(threading.Thread):
         alarm_id = alarm.get('alarm_id')
         is_end_alarm = bool(alarm.get('end_time'))
         has_start_time = bool(alarm.get('start_time'))
-        vff_path = alarm.get('vff_path')
-        if vff_path:
-            logger.info(f"收到携带 vff_path 的完整告警 JSON: {json.dumps(alarm, ensure_ascii=False)}")
+        image_base64 = alarm.get('image')
+        if image_base64:
+            logger.debug(
+                f"处理报警消息: alarm_id={alarm_id} 设备={alarm.get('device_id')} "
+                f"通道={alarm.get('channel')} 点位={alarm.get('point')} "
+                f"image(base64)={len(image_base64)}字符"
+            )
 
-        # vff 图片到账：找到等待中的开始报警并拼接（仅开始态才拼接 vff，结束态不拼接）。
-        if vff_path and alarm_id:
-            self._receive_vff(alarm_id, vff_path)
+        # image 图片到账：解码后找到等待中的开始报警并拼接（结束态不拼接图片）。
+        if image_base64 and alarm_id:
+            if self.is_image_handled(alarm_id):
+                logger.debug(f"报警 {alarm_id} 的 image 已由接收线程提前处理，跳过重复解码。")
+            else:
+                image_bytes = self._decode_alarm_image(image_base64)
+                if image_bytes:
+                    self._receive_image(alarm_id, image_bytes)
 
         if is_end_alarm:
             self._handle_end_alarm(alarm)
             return
 
-        # 纯 vff 消息（无开始/结束时间）：仅投递 vff，不触发开始/结束抓图。
-        if vff_path and not has_start_time:
+        # 纯 image 消息（无开始/结束时间）：仅投递图片，不触发开始/结束抓图。
+        if image_base64 and not has_start_time:
             return
 
-        # 以下按开始报警处理（携带 vff 的开始消息也会正常抓图）
+        # 以下按开始报警处理（携带 image 的开始消息也会正常抓图）
         self._handle_start_alarm(alarm)
 
     def _handle_start_alarm(self, alarm):
@@ -544,9 +741,25 @@ class ProcessingWorker(threading.Thread):
             }
             self._set_active_alarm_context(alarm_id, active_context)
 
-            tasks = self.cam_mgr._find_point_cfgs(alarm.get('point'))
+            device_id = alarm.get('device_id')
+            channel = alarm.get('channel')
+            point = alarm.get('point')
+            tasks = self.cam_mgr._find_point_cfgs(device_id, channel, point)
+            if tasks is None:
+                # 设备ID 或通道号未配置：直接放弃该条报警（不抓图、不转发、不保留图片缓存）。
+                # 具体未配置的设备/通道已由 CameraManager 输出 ERROR 日志，这里只补充报警ID。
+                logger.debug(
+                    f"处理线程：报警 {alarm_id}（设备 {device_id} 通道 {channel}）未配置，"
+                    f"直接放弃该条报警。"
+                )
+                self._pop_active_alarm_context(alarm_id)
+                self._discard_cached_image(alarm_id)
+                return
             if not tasks:
-                logger.warning(f"处理线程：报警 {alarm_id} 点位 {alarm.get('point')} 未配置，跳过抓图。")
+                logger.warning(
+                    f"处理线程：报警 {alarm_id}（设备 {device_id} 通道 {channel} 点位 {point}）"
+                    f"在已配置的通道下未匹配到点位区间，跳过抓图。"
+                )
                 if self.forward_unconfigured:
                     logger.info(f"根据配置，为未配置点位的报警 {alarm_id} 生成一条无图片信息。")
                     now = datetime.now()
@@ -577,9 +790,12 @@ class ProcessingWorker(threading.Thread):
                     }
                     self.upload_queue.put(upload_task)
                 self._pop_active_alarm_context(alarm_id)
+                self._discard_cached_image(alarm_id)
                 return
 
-            logger.debug(f"开始处理报警: {alarm_id}")
+            logger.debug(
+                f"开始处理报警: {alarm_id}（设备 {device_id} 通道 {channel} 点位 {point}）"
+            )
             for cam_name, cam_cfg, preset in tasks:
                 image_url = ''
                 final_video_url = ''
@@ -620,7 +836,7 @@ class ProcessingWorker(threading.Thread):
         self._run_start_captures(alarm, active_context, capture_plans, all_tasks_successful)
 
     def _run_start_captures(self, alarm, active_context, capture_plans, all_tasks_successful=True):
-        """开始报警抓图阶段：抓图 → 回填图片数据 → 推入异步上传队列（等待 vff 拼接）。"""
+        """开始报警抓图阶段：抓图 → 回填图片数据 → 推入异步上传队列（等待 image 拼接）。"""
         alarm_id = alarm.get('alarm_id')
         upload_tasks = []
 
@@ -643,8 +859,8 @@ class ProcessingWorker(threading.Thread):
             logger.debug(f"已为相机 {cam_name} 生成待上传任务 (抓图是否就绪: {bool(image_data)})")
 
         if upload_tasks:
-            if self.vff_wait_timeout_seconds > 0:
-                self._register_pending_vff(alarm_id, upload_tasks)
+            if self.image_wait_timeout_seconds > 0:
+                self._register_pending_image(alarm_id, upload_tasks)
             else:
                 logger.debug(f"报警 {alarm_id} 所有抓图动作已完成，将 {len(upload_tasks)} 条任务推入异步上传队列...")
                 self._dispatch_tasks(alarm_id, upload_tasks)
@@ -681,6 +897,8 @@ class ProcessingWorker(threading.Thread):
         finally:
             self._pop_active_alarm_context(alarm_id)
             self._remember_completed_alarm(alarm_id)
+            # 结束报警到达后不再需要该报警的上游图片缓存
+            self._discard_cached_image(alarm_id)
 
     def _prepare_end_alarm_captures(self, alarm, active_context):
         """结束告警准备阶段：预生成结束态图片 URL、构建并调度结束告警消息。
@@ -689,9 +907,22 @@ class ProcessingWorker(threading.Thread):
         保证结束报警在配置延迟点准时发出。返回抓图计划列表；点位未配置时返回空列表。
         """
         alarm_id = alarm.get('alarm_id')
-        tasks = self.cam_mgr._find_point_cfgs(alarm.get('point'))
+        device_id = alarm.get('device_id')
+        channel = alarm.get('channel')
+        point = alarm.get('point')
+        tasks = self.cam_mgr._find_point_cfgs(device_id, channel, point)
+        if tasks is None:
+            # 设备ID 或通道号未配置：直接放弃该条结束报警（不抓图、不转发）
+            logger.debug(
+                f"处理线程：结束报警 {alarm_id}（设备 {device_id} 通道 {channel}）未配置，"
+                f"直接放弃该条报警。"
+            )
+            return []
         if not tasks:
-            logger.warning(f"处理线程：结束报警 {alarm_id} 点位 {alarm.get('point')} 未配置，跳过发送。")
+            logger.warning(
+                f"处理线程：结束报警 {alarm_id}（设备 {device_id} 通道 {channel} 点位 {point}）"
+                f"在已配置的通道下未匹配到点位区间，跳过发送。"
+            )
             return []
 
         capture_plans = []
@@ -943,8 +1174,6 @@ class ProcessingWorker(threading.Thread):
                             f"{ptz_wait_seconds:g} 秒（ptz_capture_wait_seconds）后再抓图。"
                         )
                         time.sleep(ptz_wait_seconds)
-                    # 统一预抓图钩子（ONVIF 为短连接，内部为空实现，保留以兼容历史流程）
-                    self.cam_mgr.relogin_before_capture(connection_info, cam_cfg)
                     self.cam_mgr.capture(connection_info, cam_cfg, channel, primary_capture_path)
                     primary_image_data = self._read_image_file(primary_capture_path, f'相机 {cam_name} 主抓图')
                     if fixed_thread:
@@ -1018,7 +1247,6 @@ class ProcessingWorker(threading.Thread):
                 connection_info = self.cam_mgr.get_client(fixed_cfg)
                 channel = fixed_cfg.get('channel', 1)
                 # 定焦相机无 PTZ 预置位操作，直接通过 ONVIF 抓图
-                self.cam_mgr.relogin_before_capture(connection_info, fixed_cfg)
                 self.cam_mgr.capture(connection_info, fixed_cfg, channel, save_path)
                 self._read_image_file(save_path, '定焦相机抓图')
                 result_holder['success'] = True
@@ -1148,26 +1376,26 @@ class ProcessingWorker(threading.Thread):
         except (ValueError, TypeError):
             return (0, 0)
 
-    def _append_vff_below(self, base_path, vff_path, output_path):
-        """将 vff 图缩放到与开始图片相同宽度后拼接到下方（base_path 在上、vff 在下）。"""
+    def _append_image_below(self, base_path, image_path, output_path):
+        """将上游 image 图缩放到与开始图片相同宽度后拼接到下方（base 在上、image 在下）。"""
         if not self.ffmpeg_path:
             raise RuntimeError(ffmpeg_missing_hint('ffmpeg'))
-        if not os.path.exists(vff_path):
-            raise RuntimeError(f'vff 图片不存在: {vff_path}')
+        if not os.path.exists(image_path):
+            raise RuntimeError(f'image 图片不存在: {image_path}')
 
         base_width = self._probe_image_width(base_path)
         if base_width <= 0:
             raise RuntimeError(f'无法读取开始图片宽度: {base_path}')
 
         _, base_ext = os.path.splitext(base_path)
-        tmp_output_path = output_path + '.vfftmp' + (base_ext if base_ext else '.jpg')
+        tmp_output_path = output_path + '.imagetmp' + (base_ext if base_ext else '.jpg')
         command = [
             self.ffmpeg_path,
             '-y',
             '-loglevel', 'error',
             '-i', base_path,
-            '-i', vff_path,
-            '-filter_complex', f"[1:v]scale={base_width}:ih[vff];[0:v][vff]vstack=inputs=2[out]",
+            '-i', image_path,
+            '-filter_complex', f"[1:v]scale={base_width}:ih[image];[0:v][image]vstack=inputs=2[out]",
             '-map', '[out]',
             '-frames:v', '1',
             '-update', '1',
@@ -1185,8 +1413,8 @@ class ProcessingWorker(threading.Thread):
         )
         try:
             if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or 'ffmpeg vff 拼接失败')
-            self._read_image_file(tmp_output_path, 'vff拼接结果')
+                raise RuntimeError(result.stderr.strip() or 'ffmpeg image 拼接失败')
+            self._read_image_file(tmp_output_path, 'image拼接结果')
             os.replace(tmp_output_path, output_path)
         finally:
             self._safe_remove_file(tmp_output_path)
@@ -1233,8 +1461,8 @@ class ProcessingWorker(threading.Thread):
     def _build_alarm_image_filename(self, alarm_dt, alarm_state, alarm_id=''):
         ts = alarm_dt.strftime('%Y%m%d_%H%M%S')
         centiseconds = alarm_dt.microsecond // 10000
-        # 基于告警ID生成唯一文件名：同一时刻并发到达的多个告警（同一秒多个点位）必须各自独立成图，
-        # 否则共享同一输出文件会被不同告警的 vff 在相同文件上反复叠加，导致多张 vff 被拼进同一张图。
+        # 基于告警ID生成唯一文件名：同一时刻并发到达的多个告警（同一秒多个点位/多个通道）必须各自独立成图，
+        # 否则共享同一输出文件会被不同告警的上游 image 在相同文件上反复叠加，导致多张图片被拼进同一张图。
         if alarm_id:
             return f"{self.boxid}_{ts}{centiseconds:02d}_{alarm_id}_{alarm_state}.jpg"
         return f"{self.boxid}_{ts}{centiseconds:02d}_{alarm_state}.jpg"

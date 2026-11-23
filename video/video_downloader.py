@@ -60,9 +60,6 @@ RTSP_SOCKET_TIMEOUT_MICROSECONDS = '5000000'
 FFMPEG_TIMEOUT_MULTIPLIER = 4
 MIN_FFMPEG_TIMEOUT_SECONDS = 60
 
-# 日志中脱敏 RTSP URL 的密码
-_RTSP_CREDENTIALS_RE = re.compile(r"(rtsp://[^:/@\s]+):[^@/\s]*@")
-
 # ffmpeg stderr 中需要过滤掉的进度/横幅类噪声行
 _FFMPEG_PROGRESS_RE = re.compile(r"(frame=|size=|bitrate=|speed=|Last message repeated)")
 # 「有连接但没有录像数据」的 ffmpeg 报错特征
@@ -90,13 +87,6 @@ def resolve_video_download_durations(cam_cfg):
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
-
-
-def mask_rtsp_url(url):
-    """日志中脱敏 RTSP URL 的密码（rtsp://user:***@ip:554/...）。"""
-    if not url:
-        return url
-    return _RTSP_CREDENTIALS_RE.sub(r"\1:***@", str(url))
 
 
 def _positive_int(value, default):
@@ -279,7 +269,7 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
     ensure_dir(os.path.dirname(os.path.abspath(save_path)) or '.')
 
     logger.debug(
-        f"[RTSP] 下载计划: url={mask_rtsp_url(rtsp_url)}，"
+        f"[RTSP] 下载计划: url={rtsp_url}，"
         f"begin={start_dt.strftime('%Y-%m-%d %H:%M:%S')}，"
         f"end={end_dt.strftime('%Y-%m-%d %H:%M:%S')}，"
         f"duration={duration_seconds:g}s，timeout={timeout_seconds:g}s，"
@@ -290,7 +280,7 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
     # 支持的参数名不同：新版为 -timeout，旧版为 -stimeout。先按新版尝试，若 ffmpeg
     # 报 "Option timeout not found" 再自动换旧参数重试。
     last_error = None
-    for timeout_option in ('-timeout', '-stimeout'):
+    for timeout_option in ('-timeout', '-stimeout'):##图灵盒子必须使用-stimeout参数，需要手动改，这个判断不生效
         # 命令格式与《私有RTSP回放协议说明.md》完全一致：
         #   ffmpeg -nostdin -rtsp_transport tcp -timeout 5000000
         #          -i "<RTSP_URL>" -t <时长秒> -c copy -an -y "<输出.mp4>"
@@ -307,7 +297,7 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
             '-an',
             '-y', save_path,
         ]
-        logger.debug(f"[RTSP] 执行命令: {mask_rtsp_url(format_command_for_log(command))}")
+        logger.debug(f"[RTSP] 执行命令: {format_command_for_log(command)}")
 
         try:
             returncode, _stdout, stderr = run_command(command, timeout_seconds)
@@ -335,7 +325,7 @@ def download_recording_by_rtsp(cam_cfg, start_dt, end_dt, save_path):
         hint = _no_recording_hint(cam_cfg, raw_stderr)
         if hint:
             logger.error(
-                f"[RTSP] 请求时间段内没有录像数据（url={mask_rtsp_url(rtsp_url)}）{hint}"
+                f"[RTSP] 请求时间段内没有录像数据（url={rtsp_url}）{hint}"
             )
         raise RuntimeError(
             f"ffmpeg 拉取 RTSP 回放流失败（返回码 {returncode}）: {summary}{hint}"
@@ -772,7 +762,7 @@ def transcode_video_static(input_path, output_path):
     ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True,encoding='utf-8', errors='replace', timeout=300,**no_window_kwargs())
+        subprocess.run(command, check=True, capture_output=True, text=True,encoding='utf-8', errors='replace', timeout=300,**no_window_kwargs())  # pyright: ignore[reportCallIssue]
         logger.debug(f"视频转码成功: {output_path}")
         return True
     except subprocess.CalledProcessError as e:

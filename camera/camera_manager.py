@@ -19,6 +19,7 @@ import threading
 from contextlib import contextmanager
 
 from . import onvif_camera
+from core.alarm_utils import normalize_alarm_key
 
 logger = logging.getLogger("alarm_app.camera")
 
@@ -37,7 +38,7 @@ class DeviceOperationGate:
       因此同一设备的录像下载默认串行执行（max_shared=1），多路报警依次排队下载，
       避免互相挤占设备码流资源导致下载失败。
 
-    抓图/PTZ/重登不经过门闩：多条报警同时到达时同时转预置位、并行抓图，
+    抓图/PTZ 不经过门闩：多条报警同时到达时同时转预置位、并行抓图，
     相互之间不做任何串行排队（ONVIF 抓图/PTZ 与 RTSP 下载使用完全独立的协议栈，
     可以真正并行）。
     """
@@ -82,6 +83,8 @@ class CameraManager:
         self.clients = {}
         self.lock = threading.Lock()
         self.config = config
+        # 已提示过的未配置设备/通道，避免上游持续上报时 ERROR 日志刷屏
+        self._missing_mapping_warned = set()
         # 设备级操作门闩（key 为设备 IP）：连接清理走 exclusive（自身串行），
         # 录像下载走 shared（同一设备串行，防止并发回放挤满设备码流资源）；
         # 两者与抓图/PTZ 完全并行互不阻塞
@@ -125,23 +128,108 @@ class CameraManager:
                 self._device_operation_gates[lock_key] = gate
             return gate
 
-    def _find_point_cfgs(self, point):
-        """根据报警点位匹配对应的摄像机配置列表。"""
-        out = []
-        points_cfg = self.config.get('points', {})
+    def _log_missing_mapping(self, key, message):
+        """未配置的设备/通道只在首次出现时输出 ERROR，避免上游持续上报时日志刷屏。"""
+        if key in self._missing_mapping_warned:
+            logger.debug(f"{message}（重复消息，已抑制重复 ERROR 日志）")
+            return
+        self._missing_mapping_warned.add(key)
+        logger.error(message)
+
+    def _find_point_cfgs(self, device_id, channel, point):
+        """根据报警的【设备ID + 通道号 + 点位】匹配对应的摄像机配置列表。
+
+        配置结构（config.json 中的 ``deviceid_channel_points``）::
+
+            {
+              "<device_id>": {
+                "<channel>": {
+                  "min-max": {"camera": "<cameras 中的逻辑名称>", "preset": <预置位号>}
+                }
+              }
+            }
+
+        不同设备、不同通道各自维护自己的点位区间，因此同一点位号可以在不同
+        通道下映射到不同摄像头 / 不同预置位。
+
+        返回值：
+        - ``None``：设备ID 或通道号未在 deviceid_channel_points 中配置
+          （含配置缺失/无效），调用方应直接放弃该条报警，不做任何回退；
+        - ``[]``：设备与通道已配置，但点位未命中任何区间；
+        - ``[(cam_name, cam_cfg, preset), ...]``：匹配成功。
+        """
+        mapping = self.config.get('deviceid_channel_points')
         cameras_cfg = self.config.get('cameras', {})
-        for rng, info in points_cfg.items():
+        if not isinstance(mapping, dict) or not mapping:
+            self._log_missing_mapping(
+                ('__no_mapping__',),
+                "配置中未定义 'deviceid_channel_points'，无法将报警点位匹配到摄像机预置位，"
+                "该条报警将被放弃。",
+            )
+            return None
+
+        device_key = normalize_alarm_key(device_id)
+        channel_key = normalize_alarm_key(channel)
+
+        channel_cfgs = mapping.get(device_key)
+        if not isinstance(channel_cfgs, dict):
+            self._log_missing_mapping(
+                (device_key, channel_key),
+                f"报警设备 '{device_key}' 未在 deviceid_channel_points 中配置，"
+                f"直接放弃该条报警。已配置设备: {list(mapping.keys())}",
+            )
+            return None
+
+        point_map = channel_cfgs.get(channel_key)
+        if not isinstance(point_map, dict):
+            self._log_missing_mapping(
+                (device_key, channel_key),
+                f"报警通道 '{channel_key}' 未在设备 '{device_key}' 下配置，"
+                f"直接放弃该条报警。已配置通道: {list(channel_cfgs.keys())}",
+            )
+            return None
+
+        try:
+            point_value = int(point)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"报警点位 '{point}'（设备 {device_key} 通道 {channel_key}）不是有效的整数，"
+                f"无可匹配点位。"
+            )
+            return []
+
+        out = []
+        for rng, info in point_map.items():
+            if not isinstance(info, dict):
+                logger.error(
+                    f"解析设备 {device_key} 通道 {channel_key} 的点位配置 '{rng}' 失败: 配置项不是字典。"
+                )
+                continue
             try:
-                lo, hi = map(int, rng.split('-'))
-                if lo <= point <= hi:
-                    cam_name = info.get('camera')
-                    if cam_name in cameras_cfg:
-                        cam_cfg = cameras_cfg[cam_name]
-                        out.append((cam_name, cam_cfg, info['preset']))
-                    else:
-                        logger.warning(f"点位 {point} 配置的相机 '{cam_name}' 在相机列表中未定义。")
-            except (ValueError, KeyError) as e:
-                logger.error(f"解析点位配置 '{rng}' 失败: {e}")
+                lo_text, hi_text = str(rng).split('-', 1)
+                lo, hi = int(lo_text), int(hi_text)
+            except (ValueError, TypeError):
+                logger.error(
+                    f"解析设备 {device_key} 通道 {channel_key} 的点位区间 '{rng}' 失败"
+                    f"（格式应为 '最小点位-最大点位'）。"
+                )
+                continue
+            if not lo <= point_value <= hi:
+                continue
+            cam_name = info.get('camera')
+            cam_cfg = cameras_cfg.get(cam_name) if isinstance(cameras_cfg, dict) else None
+            if not isinstance(cam_cfg, dict):
+                logger.warning(
+                    f"设备 {device_key} 通道 {channel_key} 点位 {point_value} 配置的相机 "
+                    f"'{cam_name}' 在 cameras 中未定义。"
+                )
+                continue
+            preset = info.get('preset', -1)
+            logger.debug(
+                f"报警点位匹配成功: 设备={device_key} 通道={channel_key} 点位={point_value} "
+                f"-> 相机 {cam_name} 预置位 {preset}"
+            )
+            out.append((cam_name, cam_cfg, preset))
         return out
 
     def get_client(self, cam_cfg):
@@ -202,19 +290,10 @@ class CameraManager:
             return
         logger.debug(f"{tag}: 移动到预置点 {preset} 完成。")
 
-    def relogin_before_capture(self, connection_info, cam_cfg, cam_label=None):
-        """统一预抓图登录流程。
-
-        ONVIF 每次操作都是独立的短连接请求（底层会话按设备复用），
-        不存在长期会话失效问题，因此无需预重登。
-        """
-        tag = cam_label or f"相机 {cam_cfg['ip']}"
-        logger.debug(f"{tag} 使用 ONVIF 短连接，无需预重登。")
-
     def capture(self, connection_info, cam_cfg, channel, save_path, cam_label=None):
         """抓图到本地文件。"""
         tag = cam_label or f"相机 {cam_cfg['ip']}"
-        logger.debug(f"{tag}: 正在通过 ONVIF 抓图。")
+        # logger.debug(f"{tag}: 正在通过 ONVIF 抓图。")
         image_data = self.capture_to_memory(connection_info, cam_cfg, channel, cam_label=tag)
         if not image_data:
             raise RuntimeError(f"{tag} ONVIF 抓图返回空数据。")

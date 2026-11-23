@@ -176,4 +176,24 @@ def load_config(config_path=None):
                 for k, v in DEFAULT_FIXED_CAMERA_CONFIG.items():
                     fixed_cfg.setdefault(k, v)
 
+    # 点位联动规则：deviceid_channel_points（设备ID -> 通道号 -> 点位区间 -> {camera, preset}）
+    # 旧版 points（仅按点位区间匹配）已废弃：不同设备/通道的同一点位需要映射到不同预置位，
+    # 因此必须带上设备ID与通道号维度。
+    point_map = cfg.get('deviceid_channel_points')
+    if point_map is None:
+        if 'points' in cfg:
+            logger.warning(
+                "配置项 'points' 已废弃并被忽略，请迁移为 'deviceid_channel_points'"
+                "（结构：设备ID -> 通道号 -> 点位区间 -> {camera, preset}）。"
+            )
+        logger.warning("配置中缺少 'deviceid_channel_points'，报警将无法匹配摄像头预置位。")
+    elif not isinstance(point_map, dict):
+        logger.error(
+            "配置项 'deviceid_channel_points' 必须是字典"
+            "（结构：设备ID -> 通道号 -> 点位区间 -> {camera, preset}），当前配置无效。"
+        )
+        cfg['deviceid_channel_points'] = {}
+    elif 'points' in cfg:
+        logger.warning("配置项 'points' 已废弃并被忽略，点位联动规则统一由 'deviceid_channel_points' 决定。")
+
     return cfg

@@ -87,17 +87,9 @@ class AlarmReceiver(threading.Thread):
                     result = self.ch.queue_declare(queue='', exclusive=True)
                     queue_to_consume = result.method.queue
 
-                self.ch.queue_bind(
-                    queue=queue_to_consume,
-                    exchange=self.exchange_in,
-                    routing_key=self.routing_key
-                )
+                self.ch.queue_bind(queue=queue_to_consume,exchange=self.exchange_in,routing_key=self.routing_key)
                 logger.info(f"已连接到 RabbitMQ 并监听交换机 '{self.exchange_in}'。")
-                self.ch.basic_consume(
-                    queue=queue_to_consume,
-                    on_message_callback=self._on_message,
-                    auto_ack=True
-                )
+                self.ch.basic_consume(queue=queue_to_consume,on_message_callback=self._on_message,auto_ack=True)
                 self.ch.start_consuming()
 
             except pika.exceptions.ConnectionClosedByBroker:
@@ -114,24 +106,36 @@ class AlarmReceiver(threading.Thread):
     def _on_message(self, ch, method, props, body):
         try:
             alarm = json.loads(body)
-            logger.debug(f"--- 从RabbitMQ接收到新消息 ---{alarm}")
+            if not isinstance(alarm, dict):
+                logger.error(f"收到的报警消息不是 JSON 对象，已忽略: {alarm!r}")
+                return
+            # 日志原样输出上游消息（含完整 base64 image），便于严格按协议核对。
+            # 注意：此时尚未添加任何内部字段，打印内容与 MQ 中的报文完全一致。
+            logger.debug(
+                f"--- 从RabbitMQ接收到新消息 ---{json.dumps(alarm, ensure_ascii=False)}"
+            )
             alarm_id = alarm.get('alarm_id')
             is_end_alarm = bool(alarm.get('end_time'))
-            has_vff = bool(alarm.get('vff_path'))
+            has_image = bool(alarm.get('image'))
             if (
                 not is_end_alarm
-                and not has_vff
+                and not has_image
                 and alarm_id
                 and self.processing_worker is not None
                 and self.processing_worker.has_active_alarm_context(alarm_id)
             ):
                 logger.debug(f"接收线程：忽略重复的开始报警消息:{alarm_id}")
                 return
-            # 提前投递 vff 路径到缓存，供开始报警登记等待时原子消费，
-            # 避免 vff 排在慢速抓图任务之后、在等待超时前未被拼接而丢失。
-            if has_vff and not is_end_alarm and alarm_id and self.processing_worker is not None:
-                self.processing_worker.deliver_vff_early(alarm_id, alarm['vff_path'])
-            # 记录 MQ 消息接收时间，用于计算 alarm_send_delay_seconds 延迟转发。
+            # 提前投递 image 图片到缓存，供开始报警登记等待时原子消费，
+            # 避免图片消息排在慢速抓图任务之后、在等待超时前未被拼接而丢失。
+            # 不同设备/通道的报警各自使用独立 alarm_id，互不影响。
+            # 提前处理结果记录在处理线程内部（不写入报警消息，避免污染协议数据）。
+            if has_image and not is_end_alarm and alarm_id and self.processing_worker is not None:
+                if self.processing_worker.deliver_image_early(alarm_id, alarm['image']):
+                    self.processing_worker.mark_image_handled(alarm_id)
+            # 内部字段（不属于协议、不会写入下游MQ消息）：MQ 消息接收时间，
+            # 用于计算 alarm_send_delay_seconds 延迟转发。在日志之后添加，
+            # 保证上面打印的始终是上游原始报文。
             alarm['_received_at'] = time.time()
             self.processing_queue.put(alarm)
         except json.JSONDecodeError:

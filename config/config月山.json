@@ -1,0 +1,151 @@
+{
+  "boxid": "118",
+  "alarm_send_delay_seconds": 9,
+  "jpg_quality": 30,
+  "vff_wait_timeout_seconds": 30,
+  "ptz_capture_wait_seconds": 10,
+  "heartbeat": {
+    "url": "http://10.0.4.20:8000/boxStatucService/boxStatus/add",
+    "interval_seconds": 30,
+    "status_timeout_seconds": 60
+  },
+  "forward_unconfigured_alarms": false,
+  "rabbitmq_in": {
+    "url": "amqp://admin:hhkj1234@localhost:5672/",
+    "exchange_in": "fbg.alarm",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_status_in": {
+    "url": "amqp://admin:hhkj1234@localhost:5672/",
+    "exchange_in": "fbg.status",
+    "exchange_type": "fanout",
+    "queue_name": "",
+    "routing_key": "",
+    "durable": true
+  },
+  "rabbitmq_solar_in":{
+    "url":"amqp://admin:hhkj1234@localhost:5672/",
+    "exchange_in":"fbg.solar",
+    "exchange_type":"fanout",
+    "queue_name":"",
+    "routing_key":"",
+    "durable":true
+  },
+  "rabbitmq_out": {
+    "url": "amqp://hhkj:hhkj@10.0.4.20:5672/",
+    "exchange_out": "hhfh",
+    "exchange_type": "direct",
+    "queue_name": "fh_alarm",
+    "routing_key": "hhfh",
+    "durable": true,
+    "forward_enabled": true
+  },
+  "minio": {
+    "endpoint": "10.0.4.20:9000",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "bucket_name": "hhkj",
+    "path_prefix": "gxjc/K151+812",
+    "secure": false
+  },
+  "snapshots_dir": "snapshots",
+  "videos_dir": "videos",
+  "cameras": {
+    "cam1": {
+      "ip": "192.168.1.108",
+      "username": "admin",
+      "pwd": "HHkj1994",
+      "manufacturer": "dahua",
+      "cameraid": "C0108",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 1,
+      "rtsp_port": 554,
+      "download_delay_seconds": 40,
+      "video_download_before_seconds": 15,
+      "video_download_after_seconds": 15,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "192.168.1.108",
+        "username": "admin",
+        "pwd": "HHkj1994",
+        "manufacturer": "dahua",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    },
+    "cam2": {
+      "ip": "192.168.1.109",
+      "username": "admin",
+      "pwd": "HHkj1994",
+      "manufacturer": "dahua",
+      "cameraid": "C0188",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 1,
+      "rtsp_port": 554,
+      "download_delay_seconds": 40,
+      "video_download_before_seconds": 15,
+      "video_download_after_seconds": 15,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "192.168.1.109",
+        "username": "admin",
+        "pwd": "HHkj1994",
+        "manufacturer": "dahua",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    },
+    "cam3": {
+      "ip": "192.168.1.110",
+      "username": "admin",
+      "pwd": "HHkj1994",
+      "manufacturer": "dahua",
+      "cameraid": "C0189",
+      "onvif_port": 80,
+      "channel": 1,
+      "stream_type": 1,
+      "rtsp_port": 554,
+      "download_delay_seconds": 40,
+      "video_download_before_seconds": 15,
+      "video_download_after_seconds": 15,
+      "fixed_camera": {
+        "enabled": true,
+        "ip": "192.168.1.110",
+        "username": "admin",
+        "pwd": "HHkj1994",
+        "manufacturer": "dahua",
+        "onvif_port": 80,
+        "channel": 1,
+        "stream_type": 1
+      }
+    }
+  },
+  "deviceid_channel_points": {
+    "fbg-001": {
+      "0": {
+        "1-3": { "camera": "cam3", "preset": 2  },
+        "4-6": { "camera": "cam1", "preset": 2  },
+        "7-8": { "camera": "cam1", "preset": 3  },
+        "9-10": { "camera": "cam1", "preset":4  },
+        "11-13": { "camera": "cam3", "preset":3  },
+        "14-15": { "camera": "cam1", "preset": 5  },
+        "16-17": { "camera": "cam1", "preset": 6  },
+        "18-20": { "camera": "cam1", "preset": 7  },
+        "21-25": { "camera": "cam1", "preset": 8  },
+        "26-30": { "camera": "cam1", "preset": 9  },
+        "31-35": { "camera": "cam1", "preset": 10  },
+        "36-40": { "camera": "cam1", "preset": 11  },
+        "41-43": { "camera": "cam3", "preset": 4  },
+        "44-50": { "camera": "cam1", "preset": 12  },
+        "51-60": { "camera": "cam2", "preset": 2  }
+      }
+    }
+  }
+}

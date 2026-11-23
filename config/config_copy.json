@@ -79,10 +79,14 @@
       }
     }
   },
-  "points": {
-    "1-6": { "camera": "cam1", "preset": 2 },
-    "7-7": { "camera": "cam1", "preset": 2 },
-    "8-8": { "camera": "cam1", "preset": 3 },
-    "9-9": { "camera": "cam1", "preset": 4 }
+  "deviceid_channel_points": {
+    "das-001": {
+      "1": {
+        "1-6": { "camera": "cam1", "preset": 2 },
+        "7-7": { "camera": "cam1", "preset": 2 },
+        "8-8": { "camera": "cam1", "preset": 3 },
+        "9-9": { "camera": "cam1", "preset": 4 }
+      }
+    }
   }
 }
